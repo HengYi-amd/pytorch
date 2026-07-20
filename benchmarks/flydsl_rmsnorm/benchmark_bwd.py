@@ -33,7 +33,7 @@ DTYPES = {
     "fp32": torch.float32,
 }
 M_VALUES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
-N_VALUES = (4096, 8192, 12288, 16384, 32768)
+N_VALUES = (4096, 8192, 12288, 16384)
 SOURCE_PATHS = (
     "benchmarks/flydsl_rmsnorm/benchmark_bwd.py",
     "test/python_native/test_flydsl_registry.py",
