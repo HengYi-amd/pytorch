@@ -158,7 +158,7 @@ def _copy_if_distinct(out: torch.Tensor, self: torch.Tensor) -> None:
 
 
 def _kernel():
-    from .flydsl_kernels import scatter_add_into
+    from .flydsl_scatter_add_kernel import scatter_add_into
 
     return scatter_add_into
 

@@ -35,7 +35,9 @@ _DTYPES = {
 class TestFlyDSLScatterAdd(TestCase):
     def setUp(self):
         super().setUp()
-        from torch._native.ops.scatter_add.flydsl_kernels import clear_scatter_add_cache
+        from torch._native.ops.scatter_add.flydsl_scatter_add_kernel import (
+            clear_scatter_add_cache,
+        )
 
         clear_scatter_add_cache()
         torch.manual_seed(0)
@@ -61,7 +63,9 @@ class TestFlyDSLScatterAdd(TestCase):
 
     @parametrize("dtype", list(_DTYPES))
     def test_scatter_add_matches_aten_and_uses_cache(self, dtype):
-        from torch._native.ops.scatter_add.flydsl_kernels import scatter_add_cache_info
+        from torch._native.ops.scatter_add.flydsl_scatter_add_kernel import (
+            scatter_add_cache_info,
+        )
 
         torch_dtype = _DTYPES[dtype]
         dst, index, src = self._make_inputs(torch_dtype)
@@ -94,7 +98,9 @@ class TestFlyDSLScatterAdd(TestCase):
         self._assert_no_worse_than_aten(inplace, ref_inplace, dst, index, src)
 
     def test_unsupported_dtype_falls_back_without_compiling(self):
-        from torch._native.ops.scatter_add.flydsl_kernels import scatter_add_cache_info
+        from torch._native.ops.scatter_add.flydsl_scatter_add_kernel import (
+            scatter_add_cache_info,
+        )
 
         # float64 is not in the FlyDSL supported set -> must fall back to aten.
         dst = torch.randn((128, 64), device="cuda", dtype=torch.float64)
@@ -111,7 +117,9 @@ class TestFlyDSLScatterAdd(TestCase):
         self.assertEqual(scatter_add_cache_info().misses, 0)
 
     def test_non_vectorizable_n_falls_back_without_compiling(self):
-        from torch._native.ops.scatter_add.flydsl_kernels import scatter_add_cache_info
+        from torch._native.ops.scatter_add.flydsl_scatter_add_kernel import (
+            scatter_add_cache_info,
+        )
 
         # N=60 is not a multiple of vec_elems (fp16 needs %8) -> fall back.
         dst = torch.randn((128, 60), device="cuda", dtype=torch.float16)
