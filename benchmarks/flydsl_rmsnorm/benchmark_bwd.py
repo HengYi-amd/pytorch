@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -32,20 +32,45 @@ DTYPES = {
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
 }
-M_VALUES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
-N_VALUES = (4096, 8192, 12288, 16384)
+M_VALUES = (256, 512, 1024, 2048, 4096, 8192)
+N_VALUES = (
+    4196,
+    6144,
+    8192,
+    10240,
+    12288,
+    14336,
+    16384,
+    20480,
+    24576,
+    28672,
+    32768,
+    40960,
+    49152,
+    57344,
+    65536,
+)
 SOURCE_PATHS = (
     "benchmarks/flydsl_rmsnorm/benchmark_bwd.py",
     "test/python_native/test_flydsl_registry.py",
-    "test/python_native/test_rmsnorm_flydsl_bwd.py",
+    "test/python_native/test_rmsnorm_bwd_flydsl.py",
     "torch/_native/__init__.py",
     "torch/_native/flydsl_cache.py",
     "torch/_native/flydsl_utils.py",
     "torch/_native/ops/norm/__init__.py",
-    "torch/_native/ops/norm/flydsl_rmsnorm_bwd_kernel.py",
-    "torch/_native/ops/norm/flydsl_rmsnorm_bwd_impl.py",
+    "torch/_native/ops/norm/flydsl_rmsnorm_bwd.py",
+    "torch/_native/ops/norm/flydsl_rmsnorm_impl.py",
 )
-CSV_COLUMNS = (
+PRIMARY_CSV_COLUMNS = (
+    "m",
+    "n",
+    "dtype",
+    "flydsl_wall_to_sync_ms",
+    "aten_wall_to_sync_ms",
+    "speedup",
+    "correctness",
+)
+FULL_CSV_COLUMNS = (
     "m",
     "n",
     "dtype",
@@ -105,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--output-dir",
-        default="artifacts/rmsnorm_bwd_benchmark",
+        default="artifacts/rmsnorm_bwd_benchmark_mi355",
     )
     parser.add_argument(
         "--fail-fast",
@@ -213,8 +238,21 @@ def fused_bwd(
     )
 
 
+@contextmanager
+def force_bwd_perf_gate():
+    """Force only the BWD performance gate for this benchmark process."""
+    from torch._native.ops.norm import flydsl_rmsnorm_impl as rmsnorm_impl
+
+    original = rmsnorm_impl._fused_rms_norm_bwd_perf_wins
+    rmsnorm_impl._fused_rms_norm_bwd_perf_wins = lambda _input, _n: True
+    try:
+        yield
+    finally:
+        rmsnorm_impl._fused_rms_norm_bwd_perf_wins = original
+
+
 def cache_counters() -> dict[str, int]:
-    from torch._native.ops.norm.flydsl_rmsnorm_bwd_kernel import (
+    from torch._native.ops.norm.flydsl_rmsnorm_bwd import (
         rmsnorm_bwd_cache_info,
     )
 
@@ -511,17 +549,17 @@ def environment(device: torch.device, output_dir: Path) -> dict[str, object]:
         "torch": (repo_root / "torch/__init__.py").resolve(),
         "bwd_impl": (
             repo_root
-            / "torch/_native/ops/norm/flydsl_rmsnorm_bwd_impl.py"
+            / "torch/_native/ops/norm/flydsl_rmsnorm_impl.py"
         ).resolve(),
         "bwd_kernel": (
             repo_root
-            / "torch/_native/ops/norm/flydsl_rmsnorm_bwd_kernel.py"
+            / "torch/_native/ops/norm/flydsl_rmsnorm_bwd.py"
         ).resolve(),
     }
     loaded_sources = {"torch": Path(torch.__file__).resolve()}
     for label, module_name in (
-        ("bwd_impl", "torch._native.ops.norm.flydsl_rmsnorm_bwd_impl"),
-        ("bwd_kernel", "torch._native.ops.norm.flydsl_rmsnorm_bwd_kernel"),
+        ("bwd_impl", "torch._native.ops.norm.flydsl_rmsnorm_impl"),
+        ("bwd_kernel", "torch._native.ops.norm.flydsl_rmsnorm_bwd"),
     ):
         spec = importlib.util.find_spec(module_name)
         loaded_sources[label] = (
@@ -669,11 +707,15 @@ def snapshot_sources(output_dir: Path) -> list[dict[str, str]]:
     return entries
 
 
-def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+def write_csv(
+    path: Path,
+    rows: list[dict[str, object]],
+    columns: tuple[str, ...],
+) -> None:
     buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS)
+    writer = csv.DictWriter(buffer, fieldnames=columns)
     writer.writeheader()
-    writer.writerows({key: row.get(key) for key in CSV_COLUMNS} for row in rows)
+    writer.writerows({key: row.get(key) for key in columns} for row in rows)
     atomic_write_text(path, buffer.getvalue())
 
 
@@ -755,8 +797,9 @@ def write_report(
             "",
             "## Reproducibility",
             "",
-            "The source_snapshot directory contains exactly the nine BWD-only target "
-            "files. source_SHA256SUMS.txt is authoritative for this run.",
+            "The source_snapshot directory contains this benchmark and the relevant "
+            "merged RMSNorm registration, kernel, implementation, and test sources. "
+            "source_SHA256SUMS.txt is authoritative for this run.",
             "",
         ]
     )
@@ -785,7 +828,8 @@ def write_progress(
     }
     serialized = json.dumps(payload, indent=2, sort_keys=True)
     atomic_write_text(output_dir / "checkpoint.json", serialized)
-    write_csv(output_dir / "results.csv", rows)
+    write_csv(output_dir / "results.csv", rows, PRIMARY_CSV_COLUMNS)
+    write_csv(output_dir / "results_full.csv", rows, FULL_CSV_COLUMNS)
     write_report(output_dir / "report.md", payload, rows)
     if final:
         atomic_write_text(output_dir / "results.json", serialized)
@@ -873,8 +917,6 @@ def main() -> int:
     flydsl_operations = pn.get_dsl_operations("flydsl")
     if "_fused_rms_norm_backward" not in flydsl_operations:
         raise RuntimeError("FlyDSL RMSNorm backward is not registered")
-    if "_fused_rms_norm" in flydsl_operations:
-        raise RuntimeError("BWD-only benchmark found a FlyDSL RMSNorm FWD route")
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -894,7 +936,7 @@ def main() -> int:
     prepare_output_dir(output_dir)
     source_manifest = snapshot_sources(output_dir)
 
-    from torch._native.ops.norm.flydsl_rmsnorm_bwd_kernel import (
+    from torch._native.ops.norm.flydsl_rmsnorm_bwd import (
         clear_rmsnorm_bwd_caches,
     )
 
@@ -917,6 +959,10 @@ def main() -> int:
             "rstd": "one shared FP32 formula rstd generated outside timing",
             "correctness_failure_timing": (
                 "retained for diagnostics; invalid for speedup claims"
+            ),
+            "bwd_perf_gate": (
+                "_fused_rms_norm_bwd_perf_wins forced True inside this benchmark "
+                "process; all other public-dispatch conditions remain active"
             ),
         },
         "config": {
@@ -991,10 +1037,12 @@ def main() -> int:
     payload["cache"] = cache_counters()
     write_progress(output_dir, payload, rows, final=True)
     print(f"Results: {output_dir / 'results.csv'}", flush=True)
+    print(f"Detailed results: {output_dir / 'results_full.csv'}", flush=True)
     print(f"Report: {output_dir / 'report.md'}", flush=True)
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with force_bwd_perf_gate():
+        raise SystemExit(main())
 
