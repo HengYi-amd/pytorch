@@ -98,16 +98,14 @@ def _store_scalar(copy_atom, elem_dtype, divided_tensor, index, value):
 
 def _load_vec(copy_atom, vec_width, elem_dtype, divided_tensor, index):
     register = fx.make_rmem_tensor(vec_width, elem_dtype)
-    view = fx.slice(divided_tensor, (None, index))
-    fx.copy_atom_call(copy_atom, view, register)
-    return fx.memref_load_vec(register)
+    fx.copy_atom_call(copy_atom, divided_tensor[None, index], register)
+    return register.load()
 
 
 def _store_vec(copy_atom, vec_width, elem_dtype, divided_tensor, index, value):
     register = fx.make_rmem_tensor(vec_width, elem_dtype)
-    fx.memref_store_vec(value, register)
-    view = fx.slice(divided_tensor, (None, index))
-    fx.copy_atom_call(copy_atom, register, view)
+    register.store(value)
+    fx.copy_atom_call(copy_atom, register, divided_tensor[None, index])
 
 
 def _load_f32_vec4_scalar(copy_atom_f32, divided_tensor, vec_index):
@@ -230,7 +228,7 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
             if wave == 0:
                 in_range = lane < red_slots
                 lane_safe = in_range.select(lane, 0)
-                partial = fx.memref_load(s_red, lane_safe)
+                partial = s_red[lane_safe]
                 partial = in_range.select(partial, c_zero_f)
                 if const_expr(red_slots == 4):
                     partial = partial.addf(
@@ -244,7 +242,7 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
                 if lane == 0:
                     fx.memref_store(partial, s_red, 0)
             gpu.barrier()
-            return fx.memref_load(s_red, 0)
+            return s_red[0]
 
         input_buf = fx.rocdl.make_buffer_tensor(Input)
         gamma_buf = fx.rocdl.make_buffer_tensor(Gamma)
@@ -252,17 +250,14 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
         rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
         row_k_buf = fx.rocdl.make_buffer_tensor(RowK)
 
-        row_in = fx.slice(input_buf, (row, None))
-        row_dy = fx.slice(dy_buf, (row, None))
+        row_in = input_buf[row, None]
+        row_dy = dy_buf[row, None]
         row_div = fx.logical_divide(row_in, fx.make_layout(elem_vec_width, 1))
         dy_div = fx.logical_divide(row_dy, fx.make_layout(elem_vec_width, 1))
         gamma_div = fx.logical_divide(
             gamma_buf, fx.make_layout(elem_vec_width, 1)
         )
-        rstd_div = fx.logical_divide(rstd_buf, fx.make_layout(1, 1))
-        row_k_div = fx.logical_divide(row_k_buf, fx.make_layout(1, 1))
         copy_atom_v = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
-        copy_atom_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 32)
 
         acc0 = c_zero_f
         acc1 = c_zero_f
@@ -291,10 +286,10 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
                 acc1 = acc1 + tile_sum
 
         t = block_reduce_add(acc0 + acc1)
-        rstd = _load_scalar(copy_atom_f32, fx.Float32, rstd_div, row)
+        rstd = rstd_buf[row]
         k = t * ((rstd * rstd) / float(n))
         if tid == 0:
-            _store_scalar(copy_atom_f32, fx.Float32, row_k_div, row, k)
+            row_k_buf[row] = k
 
     @flyc.kernel
     def rmsnorm_bwd_dx_partial_kernel(
@@ -330,8 +325,6 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
         gamma_div = fx.logical_divide(
             gamma_buf, fx.make_layout(k2_copy_width, 1)
         )
-        rstd_div = fx.logical_divide(rstd_buf, fx.make_layout(1, 1))
-        row_k_div = fx.logical_divide(row_k_buf, fx.make_layout(1, 1))
 
         vec_idx = col_tile * k2_block_threads + tid
         if const_expr(dtype_str == "f32"):
@@ -352,9 +345,9 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
             init=[zero_vec],
         ):
             dw_acc = Vec(state[0])
-            row_in = fx.slice(input_buf, (row, None))
-            row_dy = fx.slice(dy_buf, (row, None))
-            row_dx = fx.slice(dx_buf, (row, None))
+            row_in = input_buf[row, None]
+            row_dy = dy_buf[row, None]
+            row_dx = dx_buf[row, None]
             row_div = fx.logical_divide(
                 row_in, fx.make_layout(k2_copy_width, 1)
             )
@@ -380,8 +373,8 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
                 )
             x = x_e if dtype_str == "f32" else x_e.to(fx.Float32)
             dy = dy_e if dtype_str == "f32" else dy_e.to(fx.Float32)
-            rstd = _load_scalar(copy_atom_f32, fx.Float32, rstd_div, row)
-            k = _load_scalar(copy_atom_f32, fx.Float32, row_k_div, row)
+            rstd = rstd_buf[row]
+            k = row_k_buf[row]
             projected = fmath.fma(
                 x,
                 full(elem_vec_width, c_zero_f - k, fx.Float32),
@@ -409,7 +402,7 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
             loop_results = yield [next_dw_acc]
 
         dw_acc = Vec(loop_results)
-        partial_row = fx.slice(partial_buf, (split, None))
+        partial_row = partial_buf[split, None]
         partial_div = fx.logical_divide(
             partial_row, fx.make_layout(_PARTIAL_VEC_WIDTH, 1)
         )
@@ -467,7 +460,7 @@ def _build_rmsnorm_bwd_module(n: int, dtype_str: str, arch: str):
             acc_hi = full(_PARTIAL_VEC_WIDTH, c_zero_f, fx.Float32)
 
         for split_i in range_constexpr(_DWEIGHT_SPLITS):
-            partial_row = fx.slice(partial_buf, (split_i, None))
+            partial_row = partial_buf[split_i, None]
             partial_div = fx.logical_divide(
                 partial_row, fx.make_layout(_PARTIAL_VEC_WIDTH, 1)
             )
