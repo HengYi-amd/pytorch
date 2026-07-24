@@ -10,6 +10,9 @@ from ... import flydsl_utils as fu
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# CDNA raw-buffer copies use 32-bit byte offsets; exactly 4 GiB wraps to zero.
+_RMSNORM_BWD_BUFFER_ADDRESS_LIMIT_BYTES = 1 << 32
+
 _HIP_AVAILABLE = torch.version.hip is not None
 _is_cow_tensor = torch._C._is_cow_tensor  # pyrefly: ignore[missing-attribute]
 _rmsnorm_bwd = None
@@ -74,23 +77,40 @@ def _common_supported(
 
 def _fused_rms_norm_bwd_perf_wins(input: torch.Tensor, n: int) -> bool:
     rows_m = input.numel() // n
-    # Tuned on MI355X using synchronized wall-to-sync measurements. Range
-    # boundaries use the slower aligned-N samples, while arbitrary-N tail
-    # probes validate the masked path. Near-crossover points stay on ATen.
+    # Tuned on MI355X from the complete power-of-two M/N grid using
+    # synchronized wall-to-sync measurements. Near-crossover points stay on
+    # ATen, and every boundary is a power of two.
     if input.dtype in (torch.float16, torch.bfloat16):
         return (
-            (4196 <= n < 16384 and rows_m >= 4096)
+            (16 <= n < 64 and rows_m >= 8192)
+            or (1024 <= n < 2048 and rows_m >= 65536)
+            or (2048 <= n < 4096 and rows_m >= 32768)
+            or (4096 <= n < 8192 and rows_m >= 8192)
+            or (8192 <= n < 16384 and rows_m >= 2048)
             or (16384 <= n < 32768 and rows_m >= 512)
-            or (32768 <= n <= 65536 and rows_m >= 256)
+            or (32768 <= n <= 65536 and rows_m >= 16)
         )
     if input.dtype == torch.float32:
         return (
-            (4196 <= n < 8192 and rows_m >= 4096)
+            (16 <= n < 64 and rows_m >= 16384)
+            or (256 <= n < 512 and rows_m >= 65536)
+            or (512 <= n < 2048 and rows_m >= 16384)
+            or (2048 <= n < 4096 and rows_m >= 8192)
+            or (4096 <= n < 8192 and rows_m >= 4096)
             or (8192 <= n < 16384 and rows_m >= 2048)
-            or (16384 <= n < 32768 and rows_m >= 512)
-            or (32768 <= n <= 65536 and rows_m >= 256)
+            or (16384 <= n < 32768 and rows_m >= 64)
+            or (32768 <= n <= 65536 and rows_m >= 16)
         )
     return False
+
+
+def _fused_rms_norm_bwd_buffer_addressable(input: torch.Tensor) -> bool:
+    """Return whether BWD raw-buffer copies can address the full matrix."""
+
+    return (
+        input.numel() * input.element_size()
+        < _RMSNORM_BWD_BUFFER_ADDRESS_LIMIT_BYTES
+    )
 
 
 def _get_rmsnorm_bwd(input: torch.Tensor):
@@ -115,6 +135,8 @@ def _fused_rms_norm_backward_cond(
     if n is None:
         return False
     if not _common_supported(input, n, weight):
+        return False
+    if not _fused_rms_norm_bwd_buffer_addressable(input):
         return False
     if (
         grad_out.shape != input.shape

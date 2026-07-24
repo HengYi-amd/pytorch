@@ -15,8 +15,8 @@ from torch.testing._internal.common_utils import (
 
 EPS = 1e-5
 # Representative public-dispatch shape enabled by the MI355 BWD gate.
-BWD_DISPATCH_M = 4096
-BWD_DISPATCH_N = 4196
+BWD_DISPATCH_M = 2048
+BWD_DISPATCH_N = 8192
 BWD_DISPATCH_DTYPE = torch.float16
 
 DIRECT_CASES = (
@@ -35,16 +35,28 @@ DIRECT_CASES = (
 
 # dtype, inclusive N range, first enabled M, and previous M kept on ATen.
 BWD_PERF_RANGES = (
-    (torch.float16, 4196, 16383, 4096, 2048),
+    (torch.float16, 16, 63, 8192, 4096),
+    (torch.float16, 1024, 2047, 65536, 32768),
+    (torch.float16, 2048, 4095, 32768, 16384),
+    (torch.float16, 4096, 8191, 8192, 4096),
+    (torch.float16, 8192, 16383, 2048, 1024),
     (torch.float16, 16384, 32767, 512, 256),
-    (torch.float16, 32768, 65536, 256, 128),
-    (torch.bfloat16, 4196, 16383, 4096, 2048),
+    (torch.float16, 32768, 65536, 16, 8),
+    (torch.bfloat16, 16, 63, 8192, 4096),
+    (torch.bfloat16, 1024, 2047, 65536, 32768),
+    (torch.bfloat16, 2048, 4095, 32768, 16384),
+    (torch.bfloat16, 4096, 8191, 8192, 4096),
+    (torch.bfloat16, 8192, 16383, 2048, 1024),
     (torch.bfloat16, 16384, 32767, 512, 256),
-    (torch.bfloat16, 32768, 65536, 256, 128),
-    (torch.float32, 4196, 8191, 4096, 2048),
+    (torch.bfloat16, 32768, 65536, 16, 8),
+    (torch.float32, 16, 63, 16384, 8192),
+    (torch.float32, 256, 511, 65536, 32768),
+    (torch.float32, 512, 2047, 16384, 8192),
+    (torch.float32, 2048, 4095, 8192, 4096),
+    (torch.float32, 4096, 8191, 4096, 2048),
     (torch.float32, 8192, 16383, 2048, 1024),
-    (torch.float32, 16384, 32767, 512, 256),
-    (torch.float32, 32768, 65536, 256, 128),
+    (torch.float32, 16384, 32767, 64, 32),
+    (torch.float32, 32768, 65536, 16, 8),
 )
 
 
@@ -126,19 +138,53 @@ class TestFlyDSLRMSNormBwdPerfGate(TestCase):
             fallback = torch.empty((aten_m, n), device="meta", dtype=dtype)
             self.assertFalse(_fused_rms_norm_bwd_perf_wins(fallback, n))
 
+    def test_unprofitable_n_gaps_stay_on_aten(self):
+        from torch._native.ops.norm.flydsl_rmsnorm_impl import (
+            _fused_rms_norm_bwd_perf_wins,
+        )
+
+        cases = (
+            (torch.float16, 64),
+            (torch.float16, 512),
+            (torch.bfloat16, 64),
+            (torch.bfloat16, 512),
+            (torch.float32, 64),
+            (torch.float32, 128),
+        )
+        for dtype, n in cases:
+            with self.subTest(dtype=dtype, n=n):
+                x = torch.empty((65536, n), device="meta", dtype=dtype)
+                self.assertFalse(_fused_rms_norm_bwd_perf_wins(x, n))
+
     def test_n_outside_measured_range_stays_on_aten(self):
         from torch._native.ops.norm.flydsl_rmsnorm_impl import (
             _fused_rms_norm_bwd_perf_wins,
         )
 
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
-            for n in (4195, 65537):
+            for n in (15, 65537):
                 with self.subTest(dtype=dtype, n=n):
                     x = torch.empty((32768, n), device="meta", dtype=dtype)
                     self.assertFalse(_fused_rms_norm_bwd_perf_wins(x, n))
 
         unsupported = torch.empty((32768, 32768), device="meta", dtype=torch.float64)
         self.assertFalse(_fused_rms_norm_bwd_perf_wins(unsupported, 32768))
+
+    def test_bwd_buffer_address_limit(self):
+        from torch._native.ops.norm.flydsl_rmsnorm_impl import (
+            _fused_rms_norm_bwd_buffer_addressable,
+        )
+
+        for dtype, m, n in (
+            (torch.float16, 32768, 65536),
+            (torch.bfloat16, 32768, 65536),
+            (torch.float32, 16384, 65536),
+        ):
+            with self.subTest(dtype=dtype):
+                below_limit = torch.empty((m // 2, n), device="meta", dtype=dtype)
+                at_limit = torch.empty((m, n), device="meta", dtype=dtype)
+                self.assertTrue(_fused_rms_norm_bwd_buffer_addressable(below_limit))
+                self.assertFalse(_fused_rms_norm_bwd_buffer_addressable(at_limit))
 
 
 @unittest.skipUnless(TEST_CUDA and torch.version.hip is not None, "ROCm required")
