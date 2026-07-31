@@ -1,4 +1,6 @@
-from .cutedsl_impl import register_to_dispatch
+from .cutedsl_impl import register_to_dispatch as _register_cutedsl
+from .flydsl_scatter_add_impl import register_to_dispatch as _register_flydsl
 
 
-register_to_dispatch()
+_register_flydsl()
+_register_cutedsl()
