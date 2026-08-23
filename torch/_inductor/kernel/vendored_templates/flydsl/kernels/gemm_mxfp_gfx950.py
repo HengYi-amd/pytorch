@@ -279,16 +279,9 @@ def mxfp_gemm_derived(
     sc_bytes_per_pass = block_threads * GFX950_SCALE_DMA_BYTES
     sc_a_bytes = block_m * scale_row_bytes
     sc_b_bytes = block_n * scale_row_bytes
-    # The scale DMA has to cover its tile exactly, for the same reason the tile
-    # DMA does: a partial pass would need predication the barrier accounting
-    # cannot express.
     scale_dma_exact = (
         sc_a_bytes % sc_bytes_per_pass == 0 and sc_b_bytes % sc_bytes_per_pass == 0
     )
-
-    # Determine the A/B pipeline depth before allocating scale LDS. Scale
-    # staging may use only the remaining capacity, so toggling it cannot reduce
-    # the number of staged operand tiles.
     if stages_b is None:
         stages_b = stages
         # Add the extra B stage only when its LDS footprint and estimated VGPR
@@ -309,8 +302,6 @@ def mxfp_gemm_derived(
             k is not None
             and deeper_smem <= GFX950_LDS_CAPACITY
             and (max(stages_a, stages + 1) - 2) * (ldg_a_iters + ldg_b_iters) < 63
-            # Apply this demand estimate only to MXFP8. MXFP4's packed fragments
-            # need a separate format-specific estimate.
             and (mxfp_format != "mxfp8"
                  or vgpr_demand + DEEPER_PIPELINE_VGPRS <= vgpr_budget)
         )
@@ -333,8 +324,6 @@ def mxfp_gemm_derived(
             f"capacity={GFX950_LDS_CAPACITY}"
         )
 
-    # lds_scale_req is an autotune dimension: 0 keeps the in-register transpose
-    # and 1 requires the LDS path.
     lds_scale = scale_dma_exact and bool(lds_scale_req)
     if lds_scale_req and not scale_dma_exact:
         raise ValueError(
@@ -427,7 +416,7 @@ def make_mxfp_param_and_validate(
         )
     except Exception:
         return None
-    # No boundary predication: the tile must divide the problem exactly.
+
     if m % block_m or n % block_n or k % block_k:
         return None
     if (k // block_k) <= max(derived.stages_a, derived.stages_b) - 1:
@@ -476,7 +465,6 @@ def make_mxfp_gemm_kernel_name(param: MXFPGemmParams) -> str:
     )
 
 
-# Keep the VMEM wait and workgroup barrier in one ordered operation.
 def __barrier(vmcnt=0):
     llvm.InlineAsmOp(
         None,
@@ -506,11 +494,7 @@ def make_mxfp_scaled_mm_gfx950(
     stages_b: int = None,
     lds_scale: int = 0,
 ):
-    """Build one tiled gfx950 MXFP scaled GEMM specialization.
-
-    ``k`` and ``block_k`` are logical elements. The launcher receives uint8
-    views whose storage K is divided by the format's elements-per-byte value.
-    """
+    """Build one tiled gfx950 MXFP scaled GEMM specialization."""
     if m <= 0 or n <= 0 or k <= 0:
         raise ValueError("m, n, and k must be positive")
     elements_per_byte = _elements_per_byte(mxfp_format)
@@ -577,9 +561,7 @@ def make_mxfp_scaled_mm_gfx950(
     # Use one dword scale load for every four repeats when both repeat counts
     # are multiples of four.
     packed_repeat_scale = d.mma_m_repeat % 4 == 0 and d.mma_n_repeat % 4 == 0
-    # For shallower register blocking, flatten (repeat, k_half) into scale units
-    # and pack four units per load whenever that uses fewer instructions than
-    # the byte-at-a-time fallback.
+
     a_scale_units = d.mma_m_repeat * d.k_halves
     b_scale_units = d.mma_n_repeat * d.k_halves
     packed_unit_scale = not packed_repeat_scale and (
@@ -590,8 +572,8 @@ def make_mxfp_scaled_mm_gfx950(
 
     # The specialized MXFP4 path keeps accumulators in AGPRs, uses a
     # boustrophedon MFMA order, and interleaves deferred fragment and DMA loads
-    # with the first MFMA cluster.
-    mxfp4_fast_path = (
+    # with MFMA clusters.
+    _prod_gate = (
         is_mxfp4
         and block_m == 256
         and block_n == 256
@@ -603,6 +585,104 @@ def make_mxfp_scaled_mm_gfx950(
         and group_m in (0, 4)
         and packed_repeat_scale
     )
+
+    ENABLE_GENERALIZED_PATH = True
+    GENERALIZED_SNAKE = True
+    GENERALIZED_AGPR = True
+    GENERALIZED_RIFFLE_MODE = 'flat'
+    GFX950_AGPRS_PER_LANE = 256
+    _generalized_gate = (
+        is_mxfp4
+        and not packed_repeat_scale
+        and (d.lds_scale or packed_unit_scale)
+        and block_m * block_n >= 4096
+        and stages >= 2
+        and group_m in (0, 4)
+        and m_waves * n_waves <= 4
+        and 4 * d.mma_m_repeat * d.mma_n_repeat <= GFX950_AGPRS_PER_LANE
+    )
+    mxfp4_fast_path = _prod_gate or (ENABLE_GENERALIZED_PATH and _generalized_gate)
+
+    _generalized_path = mxfp4_fast_path and not _prod_gate
+    fp_snake = mxfp4_fast_path and ((not _generalized_path) or GENERALIZED_SNAKE)
+    fp_agpr = mxfp4_fast_path and ((not _generalized_path) or GENERALIZED_AGPR)
+    fp_riffle = "flat" if not _generalized_path else GENERALIZED_RIFFLE_MODE
+    fp_block_drain = mxfp4_fast_path and fp_riffle == "none"
+
+    def _pending_manifest():
+        """Describe deferred operations in issue order."""
+        man = []
+        for kh in range(1, d.k_halves):
+            for _ in range(d.mma_n_repeat):
+                man.append(("frag", kh, kh))
+            for _ in range(d.mma_m_repeat):
+                man.append(("frag", kh, kh))
+        n_a = d.ldg_a_iters + (1 if d.lds_scale else 0)
+        n_b = d.ldg_b_iters + (1 if d.lds_scale else 0)
+        for _ in range(n_a):
+            man.append(("dma_a", None, d.k_halves))
+        for _ in range(n_b):
+            man.append(("dma_b", None, d.k_halves))
+        return man
+
+    def _spread_pending(ids, n_mfma):
+        """Distribute IDs monotonically over MFMA slots."""
+        n = len(ids)
+        return [((j * n_mfma) // n, ids[j]) for j in range(n)]
+
+    def _pending_plan(n_pending, n_mfma):
+        """Map MFMA slots to deferred operations while respecting first use."""
+        if n_pending == 0 or fp_riffle == "none":
+            return {}
+        man = _pending_manifest()
+        assert len(man) == n_pending, (
+            f"deferred issue manifest {len(man)} != live pending {n_pending}")
+        cells = {}
+
+        def _put(c, p, i):
+            cells.setdefault((c, p), []).append(i)
+
+        frag_ids = [i for i, e in enumerate(man) if e[0] == "frag"]
+        dma_ids = [i for i, e in enumerate(man) if e[0] != "frag"]
+        if fp_riffle == "flat":
+            # Spread all pending operations through the first MFMA cluster and
+            # issue any excess after its final MFMA.
+            slots = sorted(set((t * n_mfma) // n_pending for t in range(n_pending)))
+            for i in range(len(slots)):
+                _put(0, slots[i], i)
+            for i in range(len(slots), n_pending):
+                _put(0, n_mfma - 1, i)
+        elif fp_riffle == "staged":
+            # Issue fragment reads in the latest legal preceding cluster to
+            # shorten their live range.
+            by_stage = {}
+            for i in frag_ids:
+                by_stage.setdefault(man[i][1], []).append(i)
+            for kh in sorted(by_stage):
+                for p, i in _spread_pending(by_stage[kh], n_mfma):
+                    _put(kh - 1, p, i)
+            for p, i in _spread_pending(dma_ids, n_mfma):
+                _put(0, p, i)
+        else:
+            raise ValueError(f"unknown deferred issue mode {fp_riffle!r}")
+
+        plan = {k: tuple(v) for k, v in cells.items()}
+        seen = sorted(i for v in plan.values() for i in v)
+        assert seen == list(range(n_pending)), (
+            f"deferred issue plan covers {seen}; expected {n_pending} thunks")
+        pos = {}
+        for (c, p), v in plan.items():
+            for i in v:
+                pos[i] = (c, p)
+        for i, (kind, stage, first_use) in enumerate(man):
+            assert pos[i][0] < first_use, (
+                f"deferred thunk {i} ({kind},{stage}) issued in cluster {pos[i][0]}, "
+                f"first used in cluster {first_use}")
+        for kind in ("frag", "dma_a", "dma_b"):
+            ids = [i for i, e in enumerate(man) if e[0] == kind]
+            seq = [pos[i] for i in ids]
+            assert seq == sorted(seq), f"deferred {kind} thunks reordered"
+        return plan
     # Register-carried scale prefetch is implemented for packed repeat scales
     # and enabled when accumulator pressure leaves no other wave to hide the
     # scale-load latency.
@@ -674,9 +754,7 @@ def make_mxfp_scaled_mm_gfx950(
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         smem_a = storage.a.ptr
         smem_b = storage.b.ptr
-        # Direct-to-LDS stores address bytes, and every DMA constant below
-        # (granule size, wave stride, stage stride) is a byte count, so the
-        # write side gets its own byte-typed iterator over the same allocation.
+
         smem_a_bytes = fx.recast_iter(fx.Uint8, storage.a.ptr)
         smem_b_bytes = fx.recast_iter(fx.Uint8, storage.b.ptr)
         if const_expr(d.lds_scale):
@@ -785,15 +863,11 @@ def make_mxfp_scaled_mm_gfx950(
             frag_B_retile = thr_copy_B.retile(frag_B)
 
         frag_C = thr_mma.make_fragment_C(gC)
-        # Specialized path: derive the inline-asm accumulator type from frag_C.
-        # DCE removes the type-only load.
         _acc_ty = None
         if const_expr(mxfp4_fast_path):
             _acc_ty = fx.as_ir_value(frag_C[(None, 0), 0, 0].load()).type
         frag_C.fill(0.0)
 
-        # Wave and lane decomposition, matching the TiledMma's wave layout
-        # (m_waves, n_waves) with n_waves as the fastest mode.
         lane = fx.Int32(tid) % fx.Int32(GFX950_WAVE_SIZE)
         wave = rocdl.readfirstlane(
             fx.Int32.ir_type, fx.Int32(tid) // fx.Int32(GFX950_WAVE_SIZE)
@@ -957,9 +1031,7 @@ def make_mxfp_scaled_mm_gfx950(
                 stage,
                 a_lds_layout_bytes,
             )
-            # Issued immediately after the tile copy for the same K tile, which
-            # is what lets the pipeline schedule just add sc_a_iters to this
-            # operand's cost: vmcnt is in-order.
+
             if const_expr(d.lds_scale):
                 async_load_scale(
                     sa_flat, smem_sca, d.sc_a_bytes, d.sc_a_iters,
@@ -983,9 +1055,7 @@ def make_mxfp_scaled_mm_gfx950(
                     n_base, k_tile, stage,
                 )
 
-        # Deferred memory operations are closures drained between MFMAs. Return
-        # them through mid() rather than mutating kernel-scope state, which
-        # FlyDSL would treat as loop-carried.
+
         def dma_thunks_a(k_tile, stage):
             # Preserve async_load_a's tile-then-scale order because vmcnt
             # accounting follows program order.
@@ -1059,7 +1129,7 @@ def make_mxfp_scaled_mm_gfx950(
             d_frag.store(res)
 
         def scaled_mma(d_frag, a_frag, b_frag, scale_a, scale_b):
-            if const_expr(mxfp4_fast_path):
+            if const_expr(fp_agpr):
                 scaled_mma_agpr(d_frag, a_frag, b_frag, scale_a, scale_b)
                 return
             if const_expr(not is_mxfp4):
@@ -1081,9 +1151,7 @@ def make_mxfp_scaled_mm_gfx950(
 
         # Packed scale path. One 4-byte load holds a whole 128-element K span of
         # E8M0 scales for one row, and 64 lanes cover four MMA repeats at once.
-        # VALU permlane swaps perform the 4x4 lane-group transpose that hands
-        # each row's dword to the lane group that needs it; each lane then
-        # shifts out its own K-quarter byte.
+
         scale32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Uint32)
         scale_k32 = scale_k // 4
 
@@ -1111,9 +1179,7 @@ def make_mxfp_scaled_mm_gfx950(
 
         def packed_scale_issue(buf, base, row_base, repeat_stride, n_repeat, col32):
             """Issue dword scale loads and return their registers."""
-            # A wave's 64 lanes cover 4 repeats at once: lane group g takes the
-            # row of repeat q + g, so one dword load serves four repeats and the
-            # permlane transpose below hands each group the row it needs.
+
             regs = []
             for q in range_constexpr(0, n_repeat, 4):
                 row = row_base + fx.Int32(repeat_stride) * (fx.Int32(q) + scale_group)
@@ -1124,20 +1190,13 @@ def make_mxfp_scaled_mm_gfx950(
             return regs
 
         def packed_unit_issue(buf, base, row_base, repeat_stride, n_repeat, col_base):
-            """packed_scale_issue for blocking too shallow to give four repeats.
-
-            Unit u = mi * k_halves + kh addresses one row's dword at one MFMA K
-            step; lane group g takes unit q + g. k_halves is the fast axis so a
-            full load's four groups read consecutive dwords of at most two rows.
-            """
+            """packed_scale_issue for blocking too shallow to give four repeats."""
             n_units = n_repeat * d.k_halves
             regs = []
             for q in range_constexpr(0, n_units, 4):
                 unit = fx.Int32(q) + scale_group
                 if const_expr(q + 4 > n_units):
-                    # Short tail: wrap onto a valid unit rather than address off
-                    # the end of the scale tensor. The surplus groups' words are
-                    # simply never consumed.
+
                     unit = unit % fx.Int32(n_units)
                 row = row_base + fx.Int32(repeat_stride) * (
                     unit // fx.Int32(d.k_halves)
@@ -1282,14 +1341,9 @@ def make_mxfp_scaled_mm_gfx950(
             return av, bv, thunks
 
         def _mfma_order():
-            """Return the MFMA emission order for this wave's repeat grid.
-
-            The specialized path traverses 2x2 blocks boustrophedon along N to
-            reuse recently loaded operands. Other configurations use N outer,
-            M inner.
-            """
+            """Return the MFMA emission order for this wave's repeat grid."""
             m_rep, n_rep = d.mma_m_repeat, d.mma_n_repeat
-            if const_expr(not mxfp4_fast_path):
+            if const_expr(not fp_snake):
                 return [(mi, ni) for ni in range(n_rep) for mi in range(m_rep)]
             order, seen = [], set()
             j0s = list(range(0, n_rep - n_rep % 2, 2))
@@ -1347,16 +1401,19 @@ def make_mxfp_scaled_mm_gfx950(
             return words
 
         def mma_stage(k_tile, mid, cur_a, cur_b):
-            """Run one K tile, invoking `mid` before consuming scale values.
+            """Run one K tile and issue every deferred operation before use.
 
-            `mid` returns fragments and pending memory operations. The packed
-            repeat path interleaves pending work with MFMAs; other paths drain it
-            immediately.
+            Depending on the scale path, pending operations are either drained
+            as a block or distributed over MFMA slots by the issue plan.
             """
             if const_expr(d.lds_scale):
                 av, bv, _pending = mid()
-                for _th in _pending:
-                    _th()
+                # Select exactly one drain mode: block issue or planned issue
+                # between MFMAs.
+                if const_expr(fp_block_drain):
+                    for _th in _pending:
+                        _th()
+                _plan = _pending_plan(len(_pending), len(_MMA_ORDER))
                 sa_words = lds_scale_read(
                     smem_sca,
                     sc_lane_base_a + cur_a * fx.Int32(d.sc_a_bytes),
@@ -1379,6 +1436,9 @@ def make_mxfp_scaled_mm_gfx950(
                             sa_words[mi * d.k_halves + kh],
                             sb_words[ni * d.k_halves + kh],
                         )
+                        if const_expr((kh, _t) in _plan):
+                            for _q in range_constexpr(len(_plan[(kh, _t)])):
+                                _pending[_plan[(kh, _t)][_q]]()
                 return
 
             if const_expr(packed_unit_scale):
@@ -1392,8 +1452,11 @@ def make_mxfp_scaled_mm_gfx950(
                     col_base,
                 )
                 av, bv, _pending = mid()
-                for _th in _pending:
-                    _th()
+                # Select exactly one drain mode, as in the LDS-scale branch.
+                if const_expr(fp_block_drain):
+                    for _th in _pending:
+                        _th()
+                _plan = _pending_plan(len(_pending), len(_MMA_ORDER))
                 sa_words = packed_scale_finish(a_regs)
                 sb_words = packed_scale_finish(b_regs)
                 for kh in range_constexpr(d.k_halves):
@@ -1406,6 +1469,9 @@ def make_mxfp_scaled_mm_gfx950(
                             sa_words[mi * d.k_halves + kh],
                             sb_words[ni * d.k_halves + kh],
                         )
+                        if const_expr((kh, _t) in _plan):
+                            for _q in range_constexpr(len(_plan[(kh, _t)])):
+                                _pending[_plan[(kh, _t)][_q]]()
                 return
 
             if const_expr(packed_repeat_scale):
@@ -1607,7 +1673,7 @@ def make_mxfp_scaled_mm_gfx950(
         else:
             mma_stage(k_tile, lambda: load_fragments(cur_a, cur_b), cur_a, cur_b)
 
-        if const_expr(mxfp4_fast_path):
+        if const_expr(fp_agpr):
             llvm.InlineAsmOp(None, [], "s_nop 7", "", has_side_effects=True)
             rocdl.sched_barrier(0)
         frag_C_out = fx.make_fragment_like(frag_C, out_elem)
