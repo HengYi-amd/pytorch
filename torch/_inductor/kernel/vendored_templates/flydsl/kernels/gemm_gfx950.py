@@ -8,9 +8,16 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
+from .gemm_common_gfx950 import (
+    GFX950_DMA_BYTES,
+    GFX950_WAVE_SIZE,
+    make_gfx950_wave_layout,
+    make_row_major_swizzled_lds_layout,
+    make_transposed_swizzled_lds_layout,
+    waitcnt as __waitcnt,
+    waitcnt_barrier as __barrier,
+)
 
-GFX950_DMA_BYTES = 16
-GFX950_WAVE_SIZE = 64
 GEMM_DTYPE_BF16 = 2
 GEMM_DTYPE_FP16 = 3
 
@@ -252,32 +259,11 @@ class BlockSwizzle:
 
 def make_lds_layout(rows, block_k):
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
-    return fx.make_composed_layout(
-        swizzle,
-        fx.make_ordered_layout((rows, block_k), (1, 0)),
-    )
+    return make_row_major_swizzled_lds_layout(rows, block_k, swizzle)
 
 
 def make_transposed_lds_layout(rows, block_k):
-    # Preserve the 16-element groups required by ds_read_tr16 while swizzling
-    # contiguous-dimension bits to spread LDS bank accesses.
-    base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
-    if const_expr(rows == 64):
-        return fx.make_composed_layout(
-            fx.static(fx.SwizzleType.get(2, 4, 2)),
-            base_layout,
-        )
-    if const_expr(rows == 128):
-        return fx.make_composed_layout(
-            fx.static(fx.SwizzleType.get(2, 4, 3)),
-            base_layout,
-        )
-    if const_expr(rows == 256):
-        return fx.make_composed_layout(
-            fx.static(fx.SwizzleType.get(2, 4, 4)),
-            base_layout,
-        )
-    return base_layout
+    return make_transposed_swizzled_lds_layout(rows, block_k, 4)
 
 
 def get_wave_lds_offset(tid, async_load_bytes):
@@ -301,21 +287,6 @@ def transposed_contiguous_idx(idx, k_idx, layout, rows):
     # written by direct-to-LDS DMA back to its logical global vector.
     elem_offset = fx.get_scalar(fx.crd2idx((idx, k_idx), layout))
     return elem_offset % rows
-
-
-# TODO: Move common ROCm synchronization and buffer-load helpers to FlyDSL.
-def __barrier(vmcnt=0):
-    llvm.InlineAsmOp(
-        None,
-        [],
-        f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
-        "",
-        has_side_effects=True,
-    )
-
-
-def __waitcnt(vmcnt=0):
-    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})", "", has_side_effects=True)
 
 
 def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, dma_bytes):
@@ -1116,10 +1087,7 @@ def gemm_gfx950(
     k_per_mfma_group = param.mma_k // 4
     tiled_mma = fx.make_tiled_mma(
         mma_atom,
-        fx.make_layout(
-            (param.m_waves, param.n_waves, 1),
-            (param.n_waves, 1, 0),
-        ),
+        make_gfx950_wave_layout(param.m_waves, param.n_waves),
         fx.make_tile(
             None,
             None,
