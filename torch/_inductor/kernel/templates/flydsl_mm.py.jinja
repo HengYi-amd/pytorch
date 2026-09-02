@@ -3,7 +3,7 @@ import contextlib
 import os
 import threading
 
-from torch._inductor.kernel.vendored_templates.flydsl.kernels.gemm_gfx950 import (
+from torch._inductor.kernel.vendored_templates.flydsl.kernels.gemm_mxfp_gfx950 import (
     make_mxfp_scaled_mm_gfx950,
     MXFPGemmParams,
 )
