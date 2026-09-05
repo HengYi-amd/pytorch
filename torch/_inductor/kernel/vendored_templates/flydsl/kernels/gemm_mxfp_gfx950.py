@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Tile/Layout gfx950 MXFP4 and MXFP8 scaled GEMM.
+"""gfx950 MXFP4 and MXFP8 scaled GEMM.
 
 Both formats use per-32-element E8M0 block scales and CDNA4 16x16x128 scaled
-MFMA instructions. The common kernel owns tiling, direct-to-LDS DMA, scale
-loading, the staged waitcnt pipeline, and the output epilogue. A compile-time
-format policy selects the operand type and fragment layout. MXFP8 stores one
-E4M3 value per byte; MXFP4 stores two E2M1 values per byte, so logical K and
-storage K remain distinct throughout the address calculations.
+MFMA instructions. This kernel shares tiling, direct-to-LDS DMA, scale loading,
+the staged waitcnt pipeline, and the output epilogue between the two formats. A
+compile-time format policy selects the operand type and fragment layout. MXFP8
+stores one E4M3 value per byte; MXFP4 stores two E2M1 values per byte, so
+logical K and storage K remain distinct throughout the address calculations.
 """
 
 import functools
@@ -80,10 +80,8 @@ def __waitcnt_lgkm(lgkmcnt=0):
 def _permlane_swap(width, old, src):
     """v_permlane{16,32}_swap_b32 -> (new_old, new_src) as i32 IR values.
 
-    Both operands are read-modify-write: the instruction exchanges row groups
-    between them and returns both halves. width=32 swaps rows 2,3 of `old` with
-    rows 0,1 of `src`; width=16 swaps the odd rows of `old` with the even rows
-    of `src`.
+    Both operands are read-modify-write. The selected instruction exchanges
+    register values between 16- or 32-lane partitions and returns both results.
     """
     i32 = ir.IntegerType.get_signless(32)
     sty = ir.Type.parse("!llvm.struct<(i32, i32)>")
@@ -184,9 +182,6 @@ class MXFPGemmDerived:
     granules_per_row: int
     ldg_a_iters: int
     ldg_b_iters: int
-    # Tile DMA plus scale DMA, in program order. The pipeline schedule counts
-    # load instructions, and the scale copies are issued immediately after the
-    # tile copies for the same K tile, so they simply add to that operand's cost.
     dma_a_iters: int
     dma_b_iters: int
     ldg_wait_count: int
@@ -312,8 +307,6 @@ def mxfp_gemm_derived(
         )
 
     granules_per_row = block_k_bytes // GFX950_DMA_BYTES
-    # The LDS layout XORs the granule index with the row, so the granule count
-    # has to be a power of two or the swizzle would leave the row.
     if granules_per_row == 0 or granules_per_row & (granules_per_row - 1):
         raise ValueError(
             "the packed K-row byte count divided by the DMA width must be a "
@@ -339,9 +332,6 @@ def mxfp_gemm_derived(
     b_stage_bytes = block_n * block_k_bytes
 
     # ---- LDS-staged E8M0 scales -------------------------------------------
-    # The optional LDS path cooperatively stages each scale tile and replaces
-    # the global dword gather plus lane transpose with per-lane ds_read_u8
-    # loads.
     scale_row_bytes = block_k // MXFP_SCALE_BLOCK_K
     sc_bytes_per_pass = block_threads * GFX950_SCALE_DMA_BYTES
     sc_a_bytes = block_m * scale_row_bytes
@@ -628,8 +618,6 @@ def make_mxfp_scaled_mm_gfx950(
     use_group_m = group_m > 0 and tiles_m % group_m == 0 and tiles_m > group_m
     # Apply PID remapping together with GROUP_M traversal.
     use_xcd_remap = use_group_m
-    # Use one dword scale load for every four repeats when both repeat counts
-    # are multiples of four.
     packed_repeat_scale = d.mma_m_repeat % 4 == 0 and d.mma_n_repeat % 4 == 0
 
     a_scale_units = d.mma_m_repeat * d.k_halves
@@ -640,9 +628,6 @@ def make_mxfp_scaled_mm_gfx950(
     )
     packed_scale = packed_repeat_scale or packed_unit_scale
 
-    # The specialized MXFP4 path keeps accumulators in AGPRs, uses a
-    # boustrophedon MFMA order, and interleaves deferred fragment and DMA loads
-    # with MFMA clusters.
     native_operand_layout = not a_is_transposed and b_is_transposed
     _prod_gate = (
         is_mxfp4
@@ -718,16 +703,12 @@ def make_mxfp_scaled_mm_gfx950(
         frag_ids = [i for i, e in enumerate(man) if e[0] == "frag"]
         dma_ids = [i for i, e in enumerate(man) if e[0] != "frag"]
         if fp_riffle == "flat":
-            # Spread all pending operations through the first MFMA cluster and
-            # issue any excess after its final MFMA.
             slots = sorted(set((t * n_mfma) // n_pending for t in range(n_pending)))
             for i in range(len(slots)):
                 _put(0, slots[i], i)
             for i in range(len(slots), n_pending):
                 _put(0, n_mfma - 1, i)
         elif fp_riffle == "staged":
-            # Issue fragment reads in the latest legal preceding cluster to
-            # shorten their live range.
             by_stage = {}
             for i in frag_ids:
                 by_stage.setdefault(man[i][1], []).append(i)
@@ -756,9 +737,6 @@ def make_mxfp_scaled_mm_gfx950(
             seq = [pos[i] for i in ids]
             assert seq == sorted(seq), f"deferred {kind} thunks reordered"
         return plan
-    # Register-carried scale prefetch is implemented for packed repeat scales
-    # and enabled when accumulator pressure leaves no other wave to hide the
-    # scale-load latency.
     sc_prefetch = (
         packed_repeat_scale
         and m_waves * n_waves <= 4
@@ -777,15 +755,12 @@ def make_mxfp_scaled_mm_gfx950(
 
         pid = fx.Int32(fx.block_idx.x)
         if const_expr(use_xcd_remap):
-            # Undo PID interleaving in groups of GFX950_NUM_XCD before applying
-            # the GROUP_M swizzle, giving each group a contiguous logical range.
             xcd_q, xcd_r = divmod(tiles_m * tiles_n, GFX950_NUM_XCD)
             xcd = pid % fx.Int32(GFX950_NUM_XCD)
             in_xcd = pid // fx.Int32(GFX950_NUM_XCD)
             if const_expr(xcd_r == 0):
                 pid = xcd * fx.Int32(xcd_q) + in_xcd
             else:
-                # branchless min(xcd, xcd_r) from the sign mask of xcd - xcd_r
                 diff = xcd - fx.Int32(xcd_r)
                 pid = (
                     xcd * fx.Int32(xcd_q)
@@ -805,8 +780,6 @@ def make_mxfp_scaled_mm_gfx950(
         m_base = bid_m * fx.Int32(block_m)
         n_base = bid_n * fx.Int32(block_n)
 
-        # Arrays are sized in logical elements; their element type determines
-        # whether one or two values occupy each storage byte.
         if const_expr(d.lds_scale):
 
             @fx.struct
@@ -883,11 +856,8 @@ def make_mxfp_scaled_mm_gfx950(
         )
         wave_layout = _make_wave_layout(m_waves, n_waves)
         if const_expr(is_mxfp4):
-            # One E2M1 scale group is one contiguous 16-byte granule, so the
-            # fragment K order already matches the packed LDS row.
             tiled_mma = fx.make_tiled_mma(mma_atom, wave_layout)
         else:
-            # E4M3 uses the scaled-MFMA split-16@64 K ordering.
             mma_permutation = fx.make_tile(
                 None,
                 None,
@@ -981,8 +951,6 @@ def make_mxfp_scaled_mm_gfx950(
         wave_n = fx.Int32(wave) % fx.Int32(n_waves)
         lane_row = lane % fx.Int32(MXFP_MFMA_M)
         lane_grp = lane // fx.Int32(MXFP_MFMA_M)
-        # A TiledMma repeats the 16x16 atom across waves, so consecutive waves
-        # own 16-row stripes that interleave rather than contiguous blocks.
         m_repeat_stride = m_waves * MXFP_MFMA_M
         n_repeat_stride = n_waves * MXFP_MFMA_N
         a_row_base = wave_m * fx.Int32(MXFP_MFMA_M) + lane_row
@@ -993,10 +961,6 @@ def make_mxfp_scaled_mm_gfx950(
         r2g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_elem)
         thr_copy_C = fx.make_tiled_copy_C(r2g_atom, tiled_mma).get_slice(tid)
         thr_gC = thr_copy_C.partition_S(gC)
-
-        # The scaled-MFMA state selects one E8M0 byte for each 32-element lane
-        # group. The 16x16x128 A scale is 16 rows x 4 K blocks = 64 values = one
-        # per lane.
         scale_group = (fx.Int32(tid) % fx.Int32(GFX950_WAVE_SIZE)) // fx.Int32(
             MXFP_MFMA_N
         )
@@ -1035,7 +999,7 @@ def make_mxfp_scaled_mm_gfx950(
             is_k_major,
         ):
             # Direct-to-LDS stores are linear, so the source coordinate carries
-            # the composed LDS swizzle. Every quantity here is a byte count.
+            # the composed LDS swizzle.
             lds_ptr = make_wave_lds_ptr(smem + stage * fx.Int32(stage_bytes))
             for i in range_constexpr(ldg_iters):
                 lin = (fx.Int32(i * block_threads) + fx.Int32(tid)) * fx.Int32(
@@ -1124,8 +1088,7 @@ def make_mxfp_scaled_mm_gfx950(
             is_k_major,
             i,
         ):
-            """One iteration of async_load_tile's loop, addressed absolutely so
-            it can be emitted anywhere (the loop form advances a pointer)."""
+            """Issue one independently schedulable direct-to-LDS load step."""
             lds_ptr = make_wave_lds_ptr(smem + stage * fx.Int32(stage_bytes))
             lds_ptr = lds_ptr + fx.Int32(i * block_threads * GFX950_DMA_BYTES)
             lin = (fx.Int32(i * block_threads) + fx.Int32(tid)) * fx.Int32(
@@ -1328,7 +1291,6 @@ def make_mxfp_scaled_mm_gfx950(
 
         # Packed scale path. One 4-byte load holds a whole 128-element K span of
         # E8M0 scales for one row, and 64 lanes cover four MMA repeats at once.
-
         scale32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Uint32)
         scale_k32 = scale_k // 4
 
@@ -1367,7 +1329,7 @@ def make_mxfp_scaled_mm_gfx950(
             return regs
 
         def packed_unit_issue(buf, base, row_base, repeat_stride, n_repeat, col_base):
-            """packed_scale_issue for blocking too shallow to give four repeats."""
+            """Issue dword loads over groups of four repeat/K-half units."""
             n_units = n_repeat * d.k_halves
             regs = []
             for q in range_constexpr(0, n_units, 4):
@@ -1389,8 +1351,10 @@ def make_mxfp_scaled_mm_gfx950(
             return regs
 
         def packed_scale_finish(regs):
-            """Broadcast each loaded dword's four rows across the four lane
-            groups, then extract this lane's K-quarter byte.
+            """Exchange scale dwords among four 16-lane groups.
+
+            Each group selects its K/32 byte from every redistributed repeat
+            dword.
             """
             words = []
             for reg in regs:
@@ -1404,9 +1368,6 @@ def make_mxfp_scaled_mm_gfx950(
             return words
 
         # --- Register-carried scale prefetch ------------------------------
-        # Issue each packed scale dword one K tile before it is consumed. Since
-        # VMEM completion is ordered, the existing counted pipeline wait covers
-        # the carried load without a same-iteration vmcnt(0).
         def make_repeat_regs(n_repeat):
             regs = []
             for _q in range_constexpr(0, n_repeat, 4):
@@ -1415,7 +1376,7 @@ def make_mxfp_scaled_mm_gfx950(
 
         def packed_scale_issue_into(regs, buf, base, row_base, repeat_stride,
                                     n_repeat, col32):
-            """packed_scale_issue writing into caller-owned registers."""
+            """Issue packed repeat-scale loads into caller-owned registers."""
             for q in range_constexpr(0, n_repeat, 4):
                 row = row_base + fx.Int32(repeat_stride) * (
                     fx.Int32(q) + scale_group
@@ -1427,7 +1388,7 @@ def make_mxfp_scaled_mm_gfx950(
             return [fx.get_scalar(reg[0]).to(fx.Int32) for reg in regs]
 
         def packed_scale_words(vals):
-            """packed_scale_finish's transpose half, on already-read dwords."""
+            """Apply the lane-group exchange and byte selection to loaded dwords."""
             words = []
             for packed in vals:
                 t0, t1 = _permlane_swap(32, packed, packed)
@@ -1636,8 +1597,6 @@ def make_mxfp_scaled_mm_gfx950(
             """
             if const_expr(d.lds_scale):
                 av, bv, _pending = mid()
-                # Select exactly one drain mode: block issue or planned issue
-                # between MFMAs.
                 if const_expr(fp_block_drain):
                     for _th in _pending:
                         _th()
@@ -1680,7 +1639,6 @@ def make_mxfp_scaled_mm_gfx950(
                     col_base,
                 )
                 av, bv, _pending = mid()
-                # Select exactly one drain mode, as in the LDS-scale branch.
                 if const_expr(fp_block_drain):
                     for _th in _pending:
                         _th()
@@ -1727,8 +1685,6 @@ def make_mxfp_scaled_mm_gfx950(
                         )
                     )
                 av, bv, _pending = mid()
-                # Drain deferred fragment reads and DMA during the first MFMA
-                # cluster. Emit leftovers before later K halves consume them.
                 _slots, _left = _drain_slots(_pending, len(_MMA_ORDER))
                 for kh in range_constexpr(d.k_halves):
                     sa_words = packed_scale_finish(issued[kh][0])
@@ -1809,8 +1765,6 @@ def make_mxfp_scaled_mm_gfx950(
                 vb.append(packed_scale_read(sc_car_b[kh]))
             return va, vb
 
-        # The prefetched path mirrors the packed-repeat MFMA order and drain
-        # schedule; carried register values replace only the scale loads.
         def mma_stage_pf(mid, sav, sbv):
             av, bv, _pending = mid()
             _slots, _left = _drain_slots(_pending, len(_MMA_ORDER))
@@ -1860,8 +1814,6 @@ def make_mxfp_scaled_mm_gfx950(
                 write_a=write_a,
                 write_b=write_b,
             ):
-                # Specialized path: defer later-K-half fragment reads and
-                # next-tile DMA so mma_stage can interleave them with MFMAs.
                 av, bv, _pend = load_fragments(cur_a, cur_b,
                                                defer=mxfp4_fast_path)
                 ta = k_tile + fx.Int32(prefetch_a)
