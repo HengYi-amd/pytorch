@@ -26,6 +26,8 @@ from torch.utils._ordered_set import OrderedSet
 from .gemm_gfx950 import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
+    get_wave_lds_offset,
+    swizzled_contiguous_idx,
 )
 
 
@@ -402,15 +404,15 @@ def mxfp_gemm_derived(
     dma_b_iters = ldg_b_iters + sc_b_iters
     ldg_wait_count = dma_a_iters + dma_b_iters
     # Scale DMA contributes to the vmcnt wait budget.
-    if lds_scale and (max(stages_a, stages_b) - 2) * ldg_wait_count >= 63:
-        raise ValueError(
-            "the scale DMA lengthens the in-order vmcnt chain past the wait "
-            "budget for this pipeline depth"
-        )
+    if (max(stages_a, stages_b) - 2) * ldg_wait_count >= 63:
+        if lds_scale:
+            raise ValueError(
+                "the scale DMA lengthens the in-order vmcnt chain past the wait "
+                "budget for this pipeline depth"
+            )
+        raise ValueError("staged pipeline wait count exceeds supported range")
 
     smem_bytes = tile_bytes + scale_bytes
-    if (max(stages_a, stages_b) - 2) * ldg_wait_count >= 63:
-        raise ValueError("staged pipeline wait count exceeds supported range")
 
     return MXFPGemmDerived(
         block_threads=block_threads,
@@ -495,7 +497,6 @@ def make_mxfp_param_and_validate(
         )
     except Exception:
         return None
-    del derived
     return MXFPGemmParams(
         mxfp_format=mxfp_format,
         m=m,
@@ -643,10 +644,6 @@ def make_mxfp_scaled_mm_gfx950(
         and packed_repeat_scale
     )
 
-    ENABLE_GENERALIZED_PATH = True
-    GENERALIZED_SNAKE = True
-    GENERALIZED_AGPR = True
-    GENERALIZED_RIFFLE_MODE = 'flat'
     GFX950_AGPRS_PER_LANE = 256
     _generalized_gate = (
         is_mxfp4
@@ -659,13 +656,7 @@ def make_mxfp_scaled_mm_gfx950(
         and m_waves * n_waves <= 4
         and 4 * d.mma_m_repeat * d.mma_n_repeat <= GFX950_AGPRS_PER_LANE
     )
-    mxfp4_fast_path = _prod_gate or (ENABLE_GENERALIZED_PATH and _generalized_gate)
-
-    _generalized_path = mxfp4_fast_path and not _prod_gate
-    fp_snake = mxfp4_fast_path and ((not _generalized_path) or GENERALIZED_SNAKE)
-    fp_agpr = mxfp4_fast_path and ((not _generalized_path) or GENERALIZED_AGPR)
-    fp_riffle = "flat" if not _generalized_path else GENERALIZED_RIFFLE_MODE
-    fp_block_drain = mxfp4_fast_path and fp_riffle == "none"
+    mxfp4_fast_path = _prod_gate or _generalized_gate
 
     def _pending_manifest():
         """Describe deferred operations in issue order."""
@@ -683,14 +674,9 @@ def make_mxfp_scaled_mm_gfx950(
             man.append(("dma_b", None, d.k_halves))
         return man
 
-    def _spread_pending(ids, n_mfma):
-        """Distribute IDs monotonically over MFMA slots."""
-        n = len(ids)
-        return [((j * n_mfma) // n, ids[j]) for j in range(n)]
-
     def _pending_plan(n_pending, n_mfma):
         """Map MFMA slots to deferred operations while respecting first use."""
-        if n_pending == 0 or fp_riffle == "none":
+        if n_pending == 0:
             return {}
         man = _pending_manifest()
         assert len(man) == n_pending, (
@@ -700,25 +686,11 @@ def make_mxfp_scaled_mm_gfx950(
         def _put(c, p, i):
             cells.setdefault((c, p), []).append(i)
 
-        frag_ids = [i for i, e in enumerate(man) if e[0] == "frag"]
-        dma_ids = [i for i, e in enumerate(man) if e[0] != "frag"]
-        if fp_riffle == "flat":
-            slots = sorted(set((t * n_mfma) // n_pending for t in range(n_pending)))
-            for i in range(len(slots)):
-                _put(0, slots[i], i)
-            for i in range(len(slots), n_pending):
-                _put(0, n_mfma - 1, i)
-        elif fp_riffle == "staged":
-            by_stage = {}
-            for i in frag_ids:
-                by_stage.setdefault(man[i][1], []).append(i)
-            for kh in sorted(by_stage):
-                for p, i in _spread_pending(by_stage[kh], n_mfma):
-                    _put(kh - 1, p, i)
-            for p, i in _spread_pending(dma_ids, n_mfma):
-                _put(0, p, i)
-        else:
-            raise ValueError(f"unknown deferred issue mode {fp_riffle!r}")
+        slots = sorted(set((t * n_mfma) // n_pending for t in range(n_pending)))
+        for i in range(len(slots)):
+            _put(0, slots[i], i)
+        for i in range(len(slots), n_pending):
+            _put(0, n_mfma - 1, i)
 
         plan = {k: tuple(v) for k, v in cells.items()}
         seen = sorted(i for v in plan.values() for i in v)
@@ -965,25 +937,10 @@ def make_mxfp_scaled_mm_gfx950(
             MXFP_MFMA_N
         )
 
-        wave_offset = rocdl.readfirstlane(
-            fx.Int64.ir_type,
-            fx.Int64(
-                fx.Int32(tid)
-                // fx.Int32(GFX950_WAVE_SIZE)
-                * fx.Int32(GFX950_WAVE_SIZE * GFX950_DMA_BYTES)
-            ),
-        )
+        wave_offset = get_wave_lds_offset(tid, GFX950_DMA_BYTES)
 
         def make_wave_lds_ptr(ptr):
             return ptr + fx.Int32(wave_offset)
-
-        def swizzled_col(row, col, layout):
-            return fx.get_scalar(fx.crd2idx((row, col), layout)) % fx.Int32(
-                block_k_bytes
-            )
-
-        def transposed_contiguous_idx(idx, k_idx, layout, rows):
-            return fx.get_scalar(fx.crd2idx((idx, k_idx), layout)) % fx.Int32(rows)
 
         def async_load_tile(
             gmem,
@@ -997,11 +954,17 @@ def make_mxfp_scaled_mm_gfx950(
             rows,
             leading_stride,
             is_k_major,
+            start_i=0,
         ):
             # Direct-to-LDS stores are linear, so the source coordinate carries
             # the composed LDS swizzle.
             lds_ptr = make_wave_lds_ptr(smem + stage * fx.Int32(stage_bytes))
-            for i in range_constexpr(ldg_iters):
+            if const_expr(start_i != 0):
+                lds_ptr = lds_ptr + fx.Int32(
+                    start_i * block_threads * GFX950_DMA_BYTES
+                )
+            for j in range_constexpr(ldg_iters):
+                i = start_i + j
                 lin = (fx.Int32(i * block_threads) + fx.Int32(tid)) * fx.Int32(
                     GFX950_DMA_BYTES
                 )
@@ -1012,8 +975,8 @@ def make_mxfp_scaled_mm_gfx950(
                         global_tid % fx.Int32(outer_x_threads)
                     ) * fx.Int32(GFX950_DMA_BYTES)
                     k_local_idx = global_tid // fx.Int32(outer_x_threads)
-                    outer_local_idx = transposed_contiguous_idx(
-                        outer_lds_idx, k_local_idx, layout, rows
+                    outer_local_idx = swizzled_contiguous_idx(
+                        outer_lds_idx, k_local_idx, layout, fx.Int32(rows)
                     )
                     src_offset = (
                         k_tile * fx.Int32(block_k_bytes) + k_local_idx
@@ -1021,7 +984,9 @@ def make_mxfp_scaled_mm_gfx950(
                 else:
                     row = lin // fx.Int32(block_k_bytes)
                     dst_col = lin % fx.Int32(block_k_bytes)
-                    src_col = swizzled_col(row, dst_col, layout)
+                    src_col = swizzled_contiguous_idx(
+                        row, dst_col, layout, fx.Int32(block_k_bytes)
+                    )
                     src_offset = (
                         (rows_base + row) * leading_stride
                         + k_tile * fx.Int32(block_k_bytes)
@@ -1030,7 +995,7 @@ def make_mxfp_scaled_mm_gfx950(
                 src = fx.slice(gmem, (None, src_offset))
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 fx.copy(dma_atom, src, dst)
-                if i < ldg_iters - 1:
+                if j < ldg_iters - 1:
                     lds_ptr = lds_ptr + fx.Int32(block_threads * GFX950_DMA_BYTES)
 
         if const_expr(d.lds_scale):
@@ -1038,14 +1003,7 @@ def make_mxfp_scaled_mm_gfx950(
             sc_lds_atom = fx.make_copy_atom(fx.UniversalCopy8b(), fx.Uint8)
             # Each wave writes its own 64-lane * 4-byte chunk; the hardware
             # supplies the per-lane 4-byte stride within it.
-            sc_wave_offset = rocdl.readfirstlane(
-                fx.Int64.ir_type,
-                fx.Int64(
-                    fx.Int32(tid)
-                    // fx.Int32(GFX950_WAVE_SIZE)
-                    * fx.Int32(GFX950_WAVE_SIZE * GFX950_SCALE_DMA_BYTES)
-                ),
-            )
+            sc_wave_offset = get_wave_lds_offset(tid, GFX950_SCALE_DMA_BYTES)
 
         def async_load_scale(gmem, smem, stage_bytes, sc_iters, rows_base, k_tile,
                              stage):
@@ -1074,60 +1032,12 @@ def make_mxfp_scaled_mm_gfx950(
                         block_threads * GFX950_SCALE_DMA_BYTES
                     )
 
-        def async_load_tile_step(
-            gmem,
-            smem,
-            stage_bytes,
-            ldg_iters,
-            rows_base,
-            k_tile,
-            stage,
-            layout,
-            rows,
-            leading_stride,
-            is_k_major,
-            i,
-        ):
-            """Issue one independently schedulable direct-to-LDS load step."""
-            lds_ptr = make_wave_lds_ptr(smem + stage * fx.Int32(stage_bytes))
-            lds_ptr = lds_ptr + fx.Int32(i * block_threads * GFX950_DMA_BYTES)
-            lin = (fx.Int32(i * block_threads) + fx.Int32(tid)) * fx.Int32(
-                GFX950_DMA_BYTES
-            )
-            if const_expr(is_k_major):
-                outer_x_threads = rows // GFX950_DMA_BYTES
-                global_tid = fx.Int32(i * block_threads) + fx.Int32(tid)
-                outer_lds_idx = (
-                    global_tid % fx.Int32(outer_x_threads)
-                ) * fx.Int32(GFX950_DMA_BYTES)
-                k_local_idx = global_tid // fx.Int32(outer_x_threads)
-                outer_local_idx = transposed_contiguous_idx(
-                    outer_lds_idx, k_local_idx, layout, rows
-                )
-                src_offset = (
-                    k_tile * fx.Int32(block_k_bytes) + k_local_idx
-                ) * leading_stride + rows_base + outer_local_idx
-            else:
-                row = lin // fx.Int32(block_k_bytes)
-                dst_col = lin % fx.Int32(block_k_bytes)
-                src_col = swizzled_col(row, dst_col, layout)
-                src_offset = (
-                    (rows_base + row) * leading_stride
-                    + k_tile * fx.Int32(block_k_bytes)
-                    + src_col
-                )
-            fx.copy(
-                dma_atom,
-                fx.slice(gmem, (None, src_offset)),
-                fx.make_view(lds_ptr, fx.make_layout(1, 1)),
-            )
-
         def async_load_a_step(k_tile, stage, i):
-            async_load_tile_step(
+            async_load_tile(
                 a_flat,
                 smem_a_bytes,
                 d.a_stage_bytes,
-                d.ldg_a_iters,
+                1,
                 m_base,
                 k_tile,
                 stage,
@@ -1139,11 +1049,11 @@ def make_mxfp_scaled_mm_gfx950(
             )
 
         def async_load_b_step(k_tile, stage, i):
-            async_load_tile_step(
+            async_load_tile(
                 b_flat,
                 smem_b_bytes,
                 d.b_stage_bytes,
-                d.ldg_b_iters,
+                1,
                 n_base,
                 k_tile,
                 stage,
@@ -1269,7 +1179,7 @@ def make_mxfp_scaled_mm_gfx950(
             d_frag.store(res)
 
         def scaled_mma(d_frag, a_frag, b_frag, scale_a, scale_b):
-            if const_expr(fp_agpr):
+            if const_expr(mxfp4_fast_path):
                 scaled_mma_agpr(d_frag, a_frag, b_frag, scale_a, scale_b)
                 return
             if const_expr(not is_mxfp4):
@@ -1316,16 +1226,22 @@ def make_mxfp_scaled_mm_gfx950(
                 make_flat_buffer32(scale_b_u8, n * scale_k32), fx.make_layout(1, 1)
             )
 
-        def packed_scale_issue(buf, base, row_base, repeat_stride, n_repeat, col32):
+        def packed_scale_issue(
+            buf, base, row_base, repeat_stride, n_repeat, col32, regs=None
+        ):
             """Issue dword scale loads and return their registers."""
-
-            regs = []
+            allocate_regs = regs is None
+            if const_expr(allocate_regs):
+                regs = []
             for q in range_constexpr(0, n_repeat, 4):
                 row = row_base + fx.Int32(repeat_stride) * (fx.Int32(q) + scale_group)
                 offset = (base + row) * fx.Int32(scale_k32) + col32
-                reg = fx.make_rmem_tensor(1, fx.Uint32)
+                if const_expr(allocate_regs):
+                    reg = fx.make_rmem_tensor(1, fx.Uint32)
+                    regs.append(reg)
+                else:
+                    reg = regs[q // 4]
                 fx.copy(scale32_atom, fx.slice(buf, (None, offset)), reg)
-                regs.append(reg)
             return regs
 
         def packed_unit_issue(buf, base, row_base, repeat_stride, n_repeat, col_base):
@@ -1350,6 +1266,15 @@ def make_mxfp_scaled_mm_gfx950(
                 regs.append(reg)
             return regs
 
+        def expand_packed_scale(packed):
+            words = []
+            t0, t1 = _permlane_swap(32, packed, packed)
+            u0, u1 = _permlane_swap(16, t0, t0)
+            w0, w1 = _permlane_swap(16, t1, t1)
+            for lane_word in (u0, u1, w0, w1):
+                words.append(fx.Int32(lane_word) >> (scale_group * fx.Int32(8)))
+            return words
+
         def packed_scale_finish(regs):
             """Exchange scale dwords among four 16-lane groups.
 
@@ -1358,13 +1283,7 @@ def make_mxfp_scaled_mm_gfx950(
             """
             words = []
             for reg in regs:
-                packed = fx.get_scalar(reg[0]).to(fx.Int32)
-                t0, t1 = _permlane_swap(32, packed, packed)
-                u0, u1 = _permlane_swap(16, t0, t0)
-                w0, w1 = _permlane_swap(16, t1, t1)
-                for lane_word in (u0, u1, w0, w1):
-                    lane_word = fx.Int32(lane_word)
-                    words.append(lane_word >> (scale_group * fx.Int32(8)))
+                words.extend(expand_packed_scale(fx.get_scalar(reg[0]).to(fx.Int32)))
             return words
 
         # --- Register-carried scale prefetch ------------------------------
@@ -1374,16 +1293,6 @@ def make_mxfp_scaled_mm_gfx950(
                 regs.append(fx.make_rmem_tensor(1, fx.Uint32))
             return regs
 
-        def packed_scale_issue_into(regs, buf, base, row_base, repeat_stride,
-                                    n_repeat, col32):
-            """Issue packed repeat-scale loads into caller-owned registers."""
-            for q in range_constexpr(0, n_repeat, 4):
-                row = row_base + fx.Int32(repeat_stride) * (
-                    fx.Int32(q) + scale_group
-                )
-                offset = (base + row) * fx.Int32(scale_k32) + col32
-                fx.copy(scale32_atom, fx.slice(buf, (None, offset)), regs[q // 4])
-
         def packed_scale_read(regs):
             return [fx.get_scalar(reg[0]).to(fx.Int32) for reg in regs]
 
@@ -1391,12 +1300,7 @@ def make_mxfp_scaled_mm_gfx950(
             """Apply the lane-group exchange and byte selection to loaded dwords."""
             words = []
             for packed in vals:
-                t0, t1 = _permlane_swap(32, packed, packed)
-                u0, u1 = _permlane_swap(16, t0, t0)
-                w0, w1 = _permlane_swap(16, t1, t1)
-                for lane_word in (u0, u1, w0, w1):
-                    lane_word = fx.Int32(lane_word)
-                    words.append(lane_word >> (scale_group * fx.Int32(8)))
+                words.extend(expand_packed_scale(packed))
             return words
 
         def stage_dwords(base_bytes, stage, stage_bytes):
@@ -1532,7 +1436,7 @@ def make_mxfp_scaled_mm_gfx950(
         def _mfma_order():
             """Return the MFMA emission order for this wave's repeat grid."""
             m_rep, n_rep = d.mma_m_repeat, d.mma_n_repeat
-            if const_expr(not fp_snake):
+            if const_expr(not mxfp4_fast_path):
                 return [(mi, ni) for ni in range(n_rep) for mi in range(m_rep)]
             order, seen = [], set()
             j0s = list(range(0, n_rep - n_rep % 2, 2))
@@ -1590,16 +1494,8 @@ def make_mxfp_scaled_mm_gfx950(
             return words
 
         def mma_stage(k_tile, mid, cur_a, cur_b):
-            """Run one K tile and issue every deferred operation before use.
-
-            Depending on the scale path, pending operations are either drained
-            as a block or distributed over MFMA slots by the issue plan.
-            """
             if const_expr(d.lds_scale):
                 av, bv, _pending = mid()
-                if const_expr(fp_block_drain):
-                    for _th in _pending:
-                        _th()
                 _plan = _pending_plan(len(_pending), len(_MMA_ORDER))
                 sa_words = lds_scale_read(
                     smem_sca,
@@ -1639,9 +1535,6 @@ def make_mxfp_scaled_mm_gfx950(
                     col_base,
                 )
                 av, bv, _pending = mid()
-                if const_expr(fp_block_drain):
-                    for _th in _pending:
-                        _th()
                 _plan = _pending_plan(len(_pending), len(_MMA_ORDER))
                 sa_words = packed_scale_finish(a_regs)
                 sb_words = packed_scale_finish(b_regs)
@@ -1749,13 +1642,13 @@ def make_mxfp_scaled_mm_gfx950(
         def sc_issue(k_tile):
             for kh in range_constexpr(d.k_halves):
                 col32 = k_tile * fx.Int32(block_k // MXFP_MFMA_K) + fx.Int32(kh)
-                packed_scale_issue_into(
-                    sc_car_a[kh], sa32, m_base, a_row_base, m_repeat_stride,
-                    d.mma_m_repeat, col32,
+                packed_scale_issue(
+                    sa32, m_base, a_row_base, m_repeat_stride,
+                    d.mma_m_repeat, col32, sc_car_a[kh],
                 )
-                packed_scale_issue_into(
-                    sc_car_b[kh], sb32, n_base, b_row_base, n_repeat_stride,
-                    d.mma_n_repeat, col32,
+                packed_scale_issue(
+                    sb32, n_base, b_row_base, n_repeat_stride,
+                    d.mma_n_repeat, col32, sc_car_b[kh],
                 )
 
         def sc_read():
@@ -1853,7 +1746,7 @@ def make_mxfp_scaled_mm_gfx950(
         else:
             mma_stage(k_tile, lambda: load_fragments(cur_a, cur_b), cur_a, cur_b)
 
-        if const_expr(fp_agpr):
+        if const_expr(mxfp4_fast_path):
             llvm.InlineAsmOp(None, [], "s_nop 7", "", has_side_effects=True)
             rocdl.sched_barrier(0)
         frag_C_out = fx.make_fragment_like(frag_C, out_elem)
