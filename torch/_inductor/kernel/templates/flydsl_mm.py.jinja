@@ -113,14 +113,8 @@ def _make_param():
                 _param = param
 
     configure_flydsl_cache_dir()
-    compile_args = (
-        _inductor_tensor_arg(output),
-        _inductor_tensor_arg(mat1),
-        _inductor_tensor_arg(mat2),
-{% if IS_MXFP %}
-        _inductor_tensor_arg(scale_a),
-        _inductor_tensor_arg(scale_b),
-{% endif %}
+    tensor_args = (output, mat1, mat2{% if IS_MXFP %}, scale_a, scale_b{% endif %})
+    compile_args = tuple(_inductor_tensor_arg(arg) for arg in tensor_args) + (
         param,
         stream,
     )
@@ -141,17 +135,7 @@ def _make_param():
             *compile_args,
             constexpr_param=param,
             compiler=flyc.compile,
-            dispatch_args=(
-                output,
-                mat1,
-                mat2,
-{% if IS_MXFP %}
-                scale_a,
-                scale_b,
-{% endif %}
-                param,
-                stream,
-            ),
+            dispatch_args=(*tensor_args, param, stream),
         )
     return output
 
@@ -183,20 +167,8 @@ def {{kernel_name}}_precompile(
                     device="cpu",
                 )
 
-{% if IS_MXFP %}
-            {{kernel_name}}_main(
-                _fake_proxy("mat1"),
-                _fake_proxy("mat2"),
-                _fake_proxy("scale_a"),
-                _fake_proxy("scale_b"),
+            input_names = ("mat1", "mat2"{% if IS_MXFP %}, "scale_a", "scale_b"{% endif %})
+            args = tuple(_fake_proxy(name) for name in input_names) + (
                 _fake_proxy("output"),
-                stream=0,
             )
-{% else %}
-            {{kernel_name}}_main(
-                _fake_proxy("mat1"),
-                _fake_proxy("mat2"),
-                _fake_proxy("output"),
-                stream=0,
-            )
-{% endif %}
+            {{kernel_name}}_main(*args, stream=0)

@@ -1251,24 +1251,23 @@ def get_flydsl_mxfp_template_kwargs(
         return []
 
     nodes = (mat_a, mat_b, scale_a, scale_b)
-    if any(node.get_device() != layout.device for node in nodes):
+    if any(
+        node.get_device() != layout.device or len(node.get_size()) != 2
+        for node in nodes
+    ):
         return []
 
-    if any(len(node.get_size()) != 2 for node in nodes):
-        return []
-
-    if mxfp_format == "mxfp4":
-        elements_per_byte = 2
-        expected_dtype = torch.float4_e2m1fn_x2
-    elif mxfp_format == "mxfp8":
-        elements_per_byte = 1
-        expected_dtype = torch.float8_e4m3fn
-    else:
+    if mxfp_format not in ("mxfp4", "mxfp8"):
         raise AssertionError(f"unsupported MXFP format: {mxfp_format}")
+    elements_per_byte = 2 if mxfp_format == "mxfp4" else 1
+    expected_dtype = (
+        torch.float4_e2m1fn_x2 if mxfp_format == "mxfp4" else torch.float8_e4m3fn
+    )
 
     static_ints = PythonWrapperCodegen.statically_known_list_of_ints_or_none
-    scale_a_shape = static_ints(scale_a.get_size())
-    scale_b_shape = static_ints(scale_b.get_size())
+    scale_a_shape, scale_b_shape = (
+        static_ints(scale.get_size()) for scale in (scale_a, scale_b)
+    )
     metadata = _get_flydsl_2d_layout_metadata(
         layout,
         mat_a,
@@ -1309,8 +1308,9 @@ def get_flydsl_mxfp_template_kwargs(
     ):
         return []
 
-    scale_a_stride = static_ints(scale_a.get_stride())
-    scale_b_stride = static_ints(scale_b.get_stride())
+    scale_a_stride, scale_b_stride = (
+        static_ints(scale.get_stride()) for scale in (scale_a, scale_b)
+    )
     if scale_a_stride is None or scale_b_stride is None:
         return []
 
@@ -1321,32 +1321,25 @@ def get_flydsl_mxfp_template_kwargs(
     ):
         return []
 
-    auxiliary_tensor_spans = (
-        (m, scale_a_stride[0], k // 32, scale_a.get_dtype().itemsize),
-        (n, scale_b_stride[0], k // 32, scale_b.get_dtype().itemsize),
-    )
     if any(
         not _fits_int32_buffer_span(rows, stride, cols, itemsize)
-        for rows, stride, cols, itemsize in auxiliary_tensor_spans
+        for rows, stride, cols, itemsize in (
+            (m, scale_a_stride[0], k // 32, scale_a.get_dtype().itemsize),
+            (n, scale_b_stride[0], k // 32, scale_b.get_dtype().itemsize),
+        )
     ):
         return []
 
     static_int = PythonWrapperCodegen.statically_known_int_or_none
-    offsets = [
-        mat_a.get_layout().offset,
-        mat_b.get_layout().offset,
-        scale_a.get_layout().offset,
-        scale_b.get_layout().offset,
-        layout.offset,
-    ]
-    if any(static_int(offset) != 0 for offset in offsets):
+    if static_int(layout.offset) != 0 or any(
+        static_int(node.get_layout().offset) != 0 for node in nodes
+    ):
         return []
 
     if (
-        mat_a.get_dtype() != expected_dtype
-        or mat_b.get_dtype() != expected_dtype
-        or scale_a.get_dtype() != torch.float8_e8m0fnu
-        or scale_b.get_dtype() != torch.float8_e8m0fnu
+        (mat_a.get_dtype(), mat_b.get_dtype()) != (expected_dtype, expected_dtype)
+        or (scale_a.get_dtype(), scale_b.get_dtype())
+        != (torch.float8_e8m0fnu, torch.float8_e8m0fnu)
         or layout.dtype not in (torch.bfloat16, torch.float16)
     ):
         return []
@@ -1438,25 +1431,25 @@ def tuned_scaled_mm_v2(
             mat2_idx=1,
             out_dtype=out_dtype,
         )
-        mxfp_configs = get_flydsl_mxfp_template_kwargs(
+        mxfp_nodes = mxfp_kernel_inputs.nodes()
+        mxfp_choices: list[ChoiceCaller] = [
+            aten__scaled_mm_v2_mxfp.bind(
+                mxfp_nodes,
+                mxfp_layout,
+                out_dtype=out_dtype,
+            )
+        ]
+        for mxfp_kwargs in get_flydsl_mxfp_template_kwargs(
             mxfp_format,
             mxfp_layout,
             mxfp_a,
             mxfp_b,
             mxfp_scale_a,
             mxfp_scale_b,
-        )
-        mxfp_choices: list[ChoiceCaller] = [
-            aten__scaled_mm_v2_mxfp.bind(
-                mxfp_kernel_inputs.nodes(),
-                mxfp_layout,
-                out_dtype=out_dtype,
-            )
-        ]
-        for mxfp_kwargs in mxfp_configs:
+        ):
             flydsl_mm_template.maybe_append_choice(
                 mxfp_choices,
-                input_nodes=list(mxfp_kernel_inputs.nodes()),
+                input_nodes=mxfp_nodes,
                 layout=mxfp_layout,
                 **mxfp_kwargs,
             )
@@ -1465,7 +1458,7 @@ def tuned_scaled_mm_v2(
             node, _ = autotune_select_algorithm(
                 "scaled_mm",
                 mxfp_choices,
-                mxfp_kernel_inputs.nodes(),
+                mxfp_nodes,
                 mxfp_layout,
             )
             return node

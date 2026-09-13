@@ -92,8 +92,8 @@ class AsyncLoadOperand:
 
     ``outer_tile_size`` and ``outer_bound`` describe the tiled M or N axis;
     ``leading_stride`` is measured in source elements; ``load_iters`` is the
-    number of 16-byte loads per thread; ``is_k_major`` selects the address
-    mapping; and ``has_outer_tail`` enables runtime M/N bounds handling.
+    number of 16-byte loads per thread; and ``is_k_major`` selects the address
+    mapping.
     """
 
     context: AsyncLoadContext
@@ -104,13 +104,11 @@ class AsyncLoadOperand:
     leading_stride: Any
     load_iters: Any
     is_k_major: Any
-    has_outer_tail: Any
 
 
 @dataclass(frozen=True)
 class Gfx950TileSchedule:
     block_threads: int
-    block_k_bytes: int
     ldg_x_threads: int
     ldg_a_iters: int
     ldg_b_iters: int
@@ -144,18 +142,16 @@ def make_tile_schedule(
     dma_bytes_per_pass = block_threads * GFX950_DMA_BYTES
     a_stage_bytes = block_m * block_k_bytes
     b_stage_bytes = block_n * block_k_bytes
-    if a_stage_bytes % dma_bytes_per_pass != 0:
-        raise ValueError(
-            "A tile load schedule must exactly cover the LDS tile: "
-            f"block_m={block_m}, block_k_bytes={block_k_bytes}, "
-            f"block_threads={block_threads}"
-        )
-    if b_stage_bytes % dma_bytes_per_pass != 0:
-        raise ValueError(
-            "B tile load schedule must exactly cover the LDS tile: "
-            f"block_n={block_n}, block_k_bytes={block_k_bytes}, "
-            f"block_threads={block_threads}"
-        )
+    for operand, axis, outer_size, stage_bytes in (
+        ("A", "m", block_m, a_stage_bytes),
+        ("B", "n", block_n, b_stage_bytes),
+    ):
+        if stage_bytes % dma_bytes_per_pass != 0:
+            raise ValueError(
+                f"{operand} tile load schedule must exactly cover the LDS tile: "
+                f"block_{axis}={outer_size}, block_k_bytes={block_k_bytes}, "
+                f"block_threads={block_threads}"
+            )
     ldg_a_iters = a_stage_bytes // dma_bytes_per_pass
     ldg_b_iters = b_stage_bytes // dma_bytes_per_pass
     ldg_wait_count = ldg_a_iters + ldg_b_iters + extra_load_iters
@@ -178,7 +174,6 @@ def make_tile_schedule(
         )
     return Gfx950TileSchedule(
         block_threads=block_threads,
-        block_k_bytes=block_k_bytes,
         ldg_x_threads=block_k_bytes // GFX950_DMA_BYTES,
         ldg_a_iters=ldg_a_iters,
         ldg_b_iters=ldg_b_iters,
@@ -255,7 +250,6 @@ def make_gemm_gfx950_param(
     elif block_n % cshuffle_vec_size != 0:
         raise ValueError("block_n must be divisible by the c-shuffle vector size")
 
-    async_load_vec_size = GFX950_DMA_BYTES // in_dbytes
     schedule = make_tile_schedule(
         block_m,
         block_n,
@@ -265,11 +259,7 @@ def make_gemm_gfx950_param(
         n_waves,
         output_tile_bytes=block_m * block_n * out_dbytes,
     )
-    ldg_x_threads = schedule.ldg_x_threads
-    block_threads = schedule.block_threads
-    ldg_a_iters = schedule.ldg_a_iters
-    ldg_b_iters = schedule.ldg_b_iters
-    load_elems_per_iter = block_threads * async_load_vec_size
+    load_elems_per_iter = schedule.block_threads * GFX950_DMA_BYTES // in_dbytes
     if use_half_tile_interleaved:
         half_ldg_a_iters = ((block_m // 2) * block_k) // load_elems_per_iter
         half_ldg_b_iters = ((block_n // 2) * block_k) // load_elems_per_iter
@@ -311,10 +301,10 @@ def make_gemm_gfx950_param(
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
-        ldg_x_threads=ldg_x_threads,
-        block_threads=block_threads,
-        ldg_a_iters=ldg_a_iters,
-        ldg_b_iters=ldg_b_iters,
+        ldg_x_threads=schedule.ldg_x_threads,
+        block_threads=schedule.block_threads,
+        ldg_a_iters=schedule.ldg_a_iters,
+        ldg_b_iters=schedule.ldg_b_iters,
         mma_m=mma_m,
         mma_n=mma_n,
         mma_k=mma_k,
@@ -442,6 +432,11 @@ def get_wave_lds_offset(tid, async_load_bytes):
 
 def make_wave_lds_ptr(ptr, wave_offset):
     return fx.recast_iter(fx.Int8, ptr) + fx.Int32(wave_offset)
+
+
+def get_leading_stride(tensor, is_transposed):
+    stride = tensor.stride[1] if const_expr(is_transposed) else tensor.stride[0]
+    return fx.Int32(fx.get_scalar(stride))
 
 
 def swizzled_contiguous_idx(idx0, idx1, layout, extent):
@@ -576,12 +571,9 @@ def async_load_operand(
         else:
             safe_global_k_idx = global_k_idx
         global_outer_idx = global_outer_offset + outer_local_idx
-        if const_expr(operand.has_outer_tail):
-            safe_global_outer_idx = (global_outer_idx < operand.outer_bound).select(
-                global_outer_idx, 0
-            )
-        else:
-            safe_global_outer_idx = global_outer_idx
+        safe_global_outer_idx = (global_outer_idx < operand.outer_bound).select(
+            global_outer_idx, 0
+        )
         if const_expr(operand.is_k_major):
             global_offset = (
                 safe_global_k_idx * operand.leading_stride + safe_global_outer_idx
@@ -702,7 +694,6 @@ def gemm_gfx950_kernel(
         leading_stride=a_leading_stride,
         load_iters=ldg_a_iters,
         is_k_major=param.a_is_transposed,
-        has_outer_tail=True,
     )
     b_load_operand = AsyncLoadOperand(
         context=ab_load_context,
@@ -713,7 +704,6 @@ def gemm_gfx950_kernel(
         leading_stride=b_leading_stride,
         load_iters=ldg_b_iters,
         is_k_major=not param.b_is_transposed,
-        has_outer_tail=True,
     )
     c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
 
@@ -950,7 +940,6 @@ def gemm_hti_gfx950_kernel(
         leading_stride=a_leading_stride,
         load_iters=half_ldg_a_iters,
         is_k_major=param.a_is_transposed,
-        has_outer_tail=True,
     )
     b_load_operand = AsyncLoadOperand(
         context=ab_load_context,
@@ -961,7 +950,6 @@ def gemm_hti_gfx950_kernel(
         leading_stride=b_leading_stride,
         load_iters=half_ldg_b_iters,
         is_k_major=not param.b_is_transposed,
-        has_outer_tail=True,
     )
     c_lds_layout = fx.make_layout((half_block_m, half_block_n), (half_block_n, 1))
 
@@ -1252,12 +1240,8 @@ def gemm_gfx950(
     m = fx.Int32(fx.get_scalar(a.shape[0]))
     n = fx.Int32(fx.get_scalar(b.shape[1]))
     k = fx.Int32(fx.get_scalar(a.shape[1]))
-    a_leading_stride = fx.Int32(
-        fx.get_scalar(a.stride[1] if const_expr(param.a_is_transposed) else a.stride[0])
-    )
-    b_leading_stride = fx.Int32(
-        fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0])
-    )
+    a_leading_stride = get_leading_stride(a, param.a_is_transposed)
+    b_leading_stride = get_leading_stride(b, param.b_is_transposed)
     tiled_mma = _make_gemm_gfx950_tiled_mma(param)
     num_pid_m = (m - 1) // param.block_m + 1
     num_pid_n = (n - 1) // param.block_n + 1
@@ -1293,7 +1277,6 @@ def infer_has_k_tail(k: int, tile_k: int, stages: int):
 
 
 def make_gemm_param_and_validate(m, n, k, kwargs):
-    result = None
     try:
         result = make_gemm_gfx950_param(**kwargs)
     except Exception:

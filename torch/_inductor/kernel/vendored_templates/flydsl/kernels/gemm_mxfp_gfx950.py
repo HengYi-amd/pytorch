@@ -10,7 +10,7 @@ stores one E4M3 value per byte; MXFP4 stores two E2M1 values per byte, so
 logical K and storage K remain distinct throughout the address calculations.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 import flydsl.compiler as flyc
@@ -28,16 +28,12 @@ from .gemm_gfx950 import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
     async_load_operand,
+    get_leading_stride,
     get_lds_swizzle_mask_bits,
     get_wave_lds_offset,
     make_lds_layout,
     make_tile_schedule,
 )
-
-
-def _make_wave_layout(m_waves, n_waves):
-    return fx.make_layout((m_waves, n_waves, 1), (n_waves, 1, 0))
-
 
 def _permlane_swap(width, old, src):
     """v_permlane{16,32}_swap_b32 -> (new_old, new_src) as i32 IR values.
@@ -299,6 +295,11 @@ def make_mxfp_param_and_validate(
     if k % MXFP_MFMA_K or k > 2**31 - 1:
         return None
     k_tiles = (k + block_k - 1) // block_k
+    derived_fields = asdict(derived)
+    derived_fields["use_cshuffle"] = (
+        derived.use_cshuffle
+        and n % (GFX950_DMA_BYTES // MXFP_OUT_BYTES) == 0
+    )
     return MXFPGemmParams(
         mxfp_format_id=MXFP_FORMAT_FP4 if mxfp_format == "mxfp4" else MXFP_FORMAT_FP8,
         out_dtype_id=(
@@ -311,29 +312,10 @@ def make_mxfp_param_and_validate(
         m_waves=m_waves,
         n_waves=n_waves,
         group_m=group_m,
-        lds_scale=derived.lds_scale,
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
-        use_cshuffle=(
-            derived.use_cshuffle
-            and n % (GFX950_DMA_BYTES // MXFP_OUT_BYTES) == 0
-        ),
         has_k_tail=(k % block_k != 0) or (k_tiles < stages - 1),
-        block_threads=derived.block_threads,
-        block_k_bytes=derived.block_k_bytes,
-        mma_m_repeat=derived.mma_m_repeat,
-        mma_n_repeat=derived.mma_n_repeat,
-        k_halves=derived.k_halves,
-        ldg_a_iters=derived.ldg_a_iters,
-        ldg_b_iters=derived.ldg_b_iters,
-        ldg_wait_count=derived.ldg_wait_count,
-        sc_a_iters=derived.sc_a_iters,
-        sc_b_iters=derived.sc_b_iters,
-        sc_a_bytes=derived.sc_a_bytes,
-        sc_b_bytes=derived.sc_b_bytes,
-        scale_row_bytes=derived.scale_row_bytes,
-        a_stage_bytes=derived.a_stage_bytes,
-        b_stage_bytes=derived.b_stage_bytes,
+        **derived_fields,
     )
 
 
@@ -369,7 +351,9 @@ def make_mxfp_tiled_mma(param: MXFPGemmParams, operand_elem):
             opsel_b=0,
         )
     )
-    wave_layout = _make_wave_layout(param.m_waves, param.n_waves)
+    wave_layout = fx.make_layout(
+        (param.m_waves, param.n_waves, 1), (param.n_waves, 1, 0)
+    )
     if const_expr(param.mxfp_format_id == MXFP_FORMAT_FP4):
         return mma_atom, fx.make_tiled_mma(mma_atom, wave_layout)
     mma_permutation = fx.make_tile(
@@ -381,28 +365,6 @@ def make_mxfp_tiled_mma(param: MXFPGemmParams, operand_elem):
         ),
     )
     return mma_atom, fx.make_tiled_mma(mma_atom, wave_layout, mma_permutation)
-
-
-def make_mxfp_ab_lds_layouts(
-    block_m, block_n, block_k_bytes, a_is_transposed, b_is_transposed
-):
-    return (
-        make_lds_layout(
-            block_m,
-            block_k_bytes,
-            a_is_transposed,
-            row_major_base=GFX950_DMA_BYTES.bit_length() - 1,
-            full_row_mask=True,
-        ),
-        make_lds_layout(
-            block_n,
-            block_k_bytes,
-            not b_is_transposed,
-            row_major_base=GFX950_DMA_BYTES.bit_length() - 1,
-            full_row_mask=True,
-        ),
-    )
-
 
 @flyc.kernel
 def gemm_mxfp_gfx950_kernel(
@@ -497,9 +459,14 @@ def gemm_mxfp_gfx950_kernel(
         smem_sca = fx.recast_iter(fx.Uint8, ab_storage.sca.ptr)
         smem_scb = fx.recast_iter(fx.Uint8, ab_storage.scb.ptr)
 
-    def make_flat_buffer(tensor, elems):
+    def make_flat_buffer(tensor, elems, elem_type=None, alignment=None):
+        src = fx.get_iter(tensor)
+        if elem_type is not None:
+            src = fx.recast_iter(
+                fx.PointerType.get(elem_type.ir_type, src.memspace, alignment), src
+            )
         flat = fx.Tensor(
-            fx.make_view(fx.get_iter(tensor), fx.make_layout(elems, 1))
+            fx.make_view(src, fx.make_layout(elems, 1))
         )
         return fx.rocdl.make_buffer_tensor(flat, max_size=True)
 
@@ -554,12 +521,19 @@ def gemm_mxfp_gfx950_kernel(
         thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(
             tid
         )
-    a_lds_layout_bytes, b_lds_layout_bytes = make_mxfp_ab_lds_layouts(
+    a_lds_layout_bytes = make_lds_layout(
         block_m,
-        block_n,
         block_k_bytes,
         a_is_transposed,
-        b_is_transposed,
+        row_major_base=GFX950_DMA_BYTES.bit_length() - 1,
+        full_row_mask=True,
+    )
+    b_lds_layout_bytes = make_lds_layout(
+        block_n,
+        block_k_bytes,
+        not b_is_transposed,
+        row_major_base=GFX950_DMA_BYTES.bit_length() - 1,
+        full_row_mask=True,
     )
 
     if const_expr(not is_mxfp4):
@@ -662,7 +636,6 @@ def gemm_mxfp_gfx950_kernel(
         leading_stride=a_leading_stride,
         load_iters=param.ldg_a_iters,
         is_k_major=a_is_transposed,
-        has_outer_tail=True,
     )
     b_load_operand = AsyncLoadOperand(
         context=ab_load_context,
@@ -673,7 +646,6 @@ def gemm_mxfp_gfx950_kernel(
         leading_stride=b_leading_stride,
         load_iters=param.ldg_b_iters,
         is_k_major=not b_is_transposed,
-        has_outer_tail=True,
     )
 
     if const_expr(param.lds_scale):
@@ -698,7 +670,6 @@ def gemm_mxfp_gfx950_kernel(
             leading_stride=scale_k,
             load_iters=param.sc_a_iters,
             is_k_major=False,
-            has_outer_tail=True,
         )
         b_scale_load_operand = AsyncLoadOperand(
             context=scale_load_context,
@@ -709,7 +680,6 @@ def gemm_mxfp_gfx950_kernel(
             leading_stride=scale_k,
             load_iters=param.sc_b_iters,
             is_k_major=False,
-            has_outer_tail=True,
         )
 
     def async_load_a_to_lds(k_tile, stage):
@@ -767,26 +737,14 @@ def gemm_mxfp_gfx950_kernel(
     scale32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Uint32)
     scale_k32 = scale_k // 4
 
-    def make_flat_buffer32(tensor, elems32):
-        # The scale tensors arrive as u8 views, so their pointer carries
-        # alignment 1 and a 4-byte load needs that restated.
-        src = fx.get_iter(tensor)
-        flat = fx.Tensor(
-            fx.make_view(
-                fx.recast_iter(
-                    fx.PointerType.get(fx.Uint32.ir_type, src.memspace, 4), src
-                ),
-                fx.make_layout(elems32, 1),
-            )
-        )
-        return fx.rocdl.make_buffer_tensor(flat, max_size=True)
-
     if const_expr(not param.lds_scale):
         sa32 = fx.logical_divide(
-            make_flat_buffer32(scale_a_u8, m * scale_k32), fx.make_layout(1, 1)
+            make_flat_buffer(scale_a_u8, m * scale_k32, fx.Uint32, 4),
+            fx.make_layout(1, 1),
         )
         sb32 = fx.logical_divide(
-            make_flat_buffer32(scale_b_u8, n * scale_k32), fx.make_layout(1, 1)
+            make_flat_buffer(scale_b_u8, n * scale_k32, fx.Uint32, 4),
+            fx.make_layout(1, 1),
         )
 
     def packed_unit_issue(
@@ -816,15 +774,6 @@ def gemm_mxfp_gfx950_kernel(
             regs.append(reg)
         return regs
 
-    def expand_packed_scale(packed):
-        words = []
-        t0, t1 = _permlane_swap(32, packed, packed)
-        u0, u1 = _permlane_swap(16, t0, t0)
-        w0, w1 = _permlane_swap(16, t1, t1)
-        for lane_word in (u0, u1, w0, w1):
-            words.append(fx.Int32(lane_word) >> (lane_grp * fx.Int32(8)))
-        return words
-
     def packed_scale_finish(regs):
         """Exchange scale dwords among four 16-lane groups.
 
@@ -833,13 +782,16 @@ def gemm_mxfp_gfx950_kernel(
         """
         words = []
         for reg in regs:
-            words.extend(expand_packed_scale(fx.get_scalar(reg[0]).to(fx.Int32)))
+            packed = fx.get_scalar(reg[0]).to(fx.Int32)
+            t0, t1 = _permlane_swap(32, packed, packed)
+            u0, u1 = _permlane_swap(16, t0, t0)
+            w0, w1 = _permlane_swap(16, t1, t1)
+            for lane_word in (u0, u1, w0, w1):
+                words.append(fx.Int32(lane_word) >> (lane_grp * fx.Int32(8)))
         return words
 
     def stage_dwords(base_bytes, stage, stage_bytes):
-
         ptr = base_bytes + stage * fx.Int32(stage_bytes)
-
         return fx.recast_iter(
             fx.PointerType.get(fx.Int32.ir_type, ptr.memspace, 16), ptr
         )
@@ -958,15 +910,10 @@ def gemm_mxfp_gfx950_kernel(
                         bv[idx] = finish_frag_transposed(bv[idx])
         return av, bv
 
-    def a_fragment(frags, mi, kh):
+    def fragment(frags, repeat, kh, n_repeat):
         if const_expr(is_mxfp4):
-            return frags[kh * param.mma_m_repeat + mi]
-        return frags[None, mi, kh]
-
-    def b_fragment(frags, ni, kh):
-        if const_expr(is_mxfp4):
-            return frags[kh * param.mma_n_repeat + ni]
-        return frags[None, ni, kh]
+            return frags[kh * n_repeat + repeat]
+        return frags[None, repeat, kh]
 
     if const_expr(param.lds_scale):
         # Base byte offset for this lane's first scale value.
@@ -1003,8 +950,8 @@ def gemm_mxfp_gfx950_kernel(
                 for mi in range_constexpr(param.mma_m_repeat):
                     scaled_mma(
                         frag_C[(None, 0), mi, ni],
-                        a_fragment(av, mi, kh),
-                        b_fragment(bv, ni, kh),
+                        fragment(av, mi, kh, param.mma_m_repeat),
+                        fragment(bv, ni, kh, param.mma_n_repeat),
                         sa_words[mi * param.k_halves + kh],
                         sb_words[ni * param.k_halves + kh],
                     )
@@ -1120,20 +1067,8 @@ def gemm_mxfp_gfx950(
     m = fx.Int32(fx.get_scalar(a.shape[0]))
     n = fx.Int32(fx.get_scalar(b.shape[1]))
     k = fx.Int32(fx.get_scalar(a.shape[1])) * fx.Int32(elements_per_byte)
-    a_leading_stride = fx.Int32(
-        fx.get_scalar(
-            a.stride[1]
-            if const_expr(param.a_is_transposed)
-            else a.stride[0]
-        )
-    )
-    b_leading_stride = fx.Int32(
-        fx.get_scalar(
-            b.stride[1]
-            if const_expr(param.b_is_transposed)
-            else b.stride[0]
-        )
-    )
+    a_leading_stride = get_leading_stride(a, param.a_is_transposed)
+    b_leading_stride = get_leading_stride(b, param.b_is_transposed)
     num_pid_m = (m - 1) // param.block_m + 1
     num_pid_n = (n - 1) // param.block_n + 1
     kernel = gemm_mxfp_gfx950_kernel
