@@ -1,13 +1,15 @@
 import functools
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import product
-from typing import cast, TypedDict
+from typing import cast, Literal, TypedDict
 
 import torch._inductor.config as config
 
 
 log = logging.getLogger(__name__)
+
+MXFPFormat = Literal["mxfp4", "mxfp8"]
 
 
 @dataclass(frozen=True)
@@ -37,13 +39,51 @@ FlyDSLGemmConfigArgs = tuple[int, int, int, int, int, int, int]
 FlyDSLHTIGemmConfigArgs = tuple[int, int, int, int, int, int, int, bool]
 
 
-def _make_gemm_param(gemm_config: dict[str, int | bool]):
+_MXFP_DEFAULT_CONFIG_ARGS: dict[MXFPFormat, tuple[FlyDSLGemmConfigArgs, ...]] = {
+    "mxfp4": (
+        (16, 16, 512, 6, 1, 1, 4),
+        (32, 64, 512, 4, 1, 2, 4),
+        (32, 64, 512, 2, 1, 2, 0),
+        (32, 32, 512, 2, 1, 2, 0),
+        (32, 32, 512, 2, 2, 1, 0),
+        (64, 64, 512, 3, 2, 2, 0),
+        (64, 64, 512, 2, 2, 2, 4),
+        (128, 128, 512, 2, 2, 4, 0),
+        (128, 128, 256, 2, 2, 2, 0),
+        (64, 64, 512, 3, 2, 2, 4),
+        (256, 256, 256, 2, 2, 2, 4),
+    ),
+    "mxfp8": (
+        (16, 16, 512, 3, 1, 1, 4),
+        (32, 32, 256, 3, 1, 1, 4),
+        (32, 64, 256, 3, 1, 1, 4),
+        (32, 32, 512, 4, 1, 2, 4),
+        (32, 32, 512, 2, 2, 1, 4),
+        (64, 64, 512, 2, 2, 2, 0),
+        (64, 64, 256, 2, 1, 2, 4),
+        (128, 128, 256, 2, 4, 1, 4),
+        (128, 128, 128, 2, 1, 2, 0),
+        (64, 64, 512, 2, 2, 2, 4),
+        (256, 256, 128, 2, 2, 2, 4),
+        (256, 256, 128, 2, 2, 2, 0),
+    ),
+}
+
+
+_BASELINE_CONFIG: dict[MXFPFormat, FlyDSLGemmConfig] = {
+    "mxfp4": FlyDSLGemmConfig(128, 128, 256, 2, 2, 2, 0),
+    "mxfp8": FlyDSLGemmConfig(128, 128, 128, 2, 2, 2, 0),
+}
+
+
+def _make_gemm_param(gemm_config: dict[str, int | bool], *, dtype_id: int = 2):
     # Keep FlyDSL optional when this heuristics module is imported.
     from torch._inductor.kernel.vendored_templates.flydsl.kernels import (
         make_gemm_gfx950_param,
     )
 
     return make_gemm_gfx950_param(
+        dtype_id=dtype_id,
         tile_m=int(gemm_config["TILE_M"]),
         tile_n=int(gemm_config["TILE_N"]),
         tile_k=int(gemm_config["TILE_K"]),
@@ -60,6 +100,20 @@ def _make_gemm_param(gemm_config: dict[str, int | bool]):
     )
 
 
+def is_gemm_config_worth_tuning(
+    m: int, n: int, k: int, gemm_config: dict[str, int | bool]
+) -> bool:
+    """Restrict large GEMMs to the largest M/N tile with eight-wave HTI."""
+    if not config.flydsl_enable_autotuning or min(m, n, k) < 4096:
+        return True
+    return (
+        gemm_config["TILE_M"] == gemm_config["TILE_N"] == 256
+        and bool(gemm_config.get("USE_HALF_TILE_INTERLEAVED", False))
+        and gemm_config["M_WAVES"] == 2
+        and gemm_config["N_WAVES"] == 4
+    )
+
+
 def is_gemm_config_valid_for_shape(
     m: int,
     n: int,
@@ -69,6 +123,7 @@ def is_gemm_config_valid_for_shape(
     *,
     a_is_transposed: bool,
     b_is_transposed: bool,
+    out_dtype_id: int | None = None,
 ) -> bool:
     """Return whether a FlyDSL config supports this concrete GEMM shape."""
     from torch._inductor.kernel.vendored_templates.flydsl.kernels import (
@@ -93,6 +148,7 @@ def is_gemm_config_valid_for_shape(
             k,
             {
                 "dtype_id": dtype_id,
+                "out_dtype_id": out_dtype_id,
                 "tile_m": int(gemm_config["TILE_M"]),
                 "tile_n": int(gemm_config["TILE_N"]),
                 "tile_k": tile_k,
@@ -206,26 +262,89 @@ def get_default_gemm_configs() -> list[FlyDSLGemmConfig]:
     return valid_configs
 
 
-def get_gemm_configs() -> list[dict[str, int | bool]]:
+def get_gemm_configs(
+    mxfp_format: MXFPFormat | None = None,
+) -> list[dict[str, int | bool]]:
     """
     Returns the configuration set for the gfx950 FlyDSL GEMM kernel.
 
     Shape compatibility is checked in the lowering before this function is called.
     By default, autotuning is disabled and we return only a single baseline config.
     """
-    if (
+    exhaustive = (
         config.flydsl_enable_autotuning
         and config.max_autotune_gemm_search_space == "EXHAUSTIVE"
-    ):
+    )
+    if mxfp_format is not None:
+        configs = _get_mxfp_candidates(mxfp_format, exhaustive)
+        if not config.flydsl_enable_autotuning:
+            configs = [c for c in configs if c == _BASELINE_CONFIG[mxfp_format]]
+        label = f"FlyDSL {mxfp_format} GEMM"
+    elif exhaustive:
         configs = get_exhaustive_gemm_configs()
+        label = "FlyDSL GEMM"
     else:
         configs = get_default_gemm_configs()
         if not config.flydsl_enable_autotuning:
             configs = [c for c in configs if c == FlyDSLGemmConfig()]
+        label = "FlyDSL GEMM"
     if not configs:
-        log.warning("No valid FlyDSL GEMM configuration is available")
+        log.warning("No valid %s configuration is available", label)
         return []
     return [asdict(gemm_config) for gemm_config in configs]
+
+
+def _project_mxfp_gemm_configs(
+    mxfp_format: MXFPFormat, gemm_configs: list[FlyDSLGemmConfig]
+) -> list[FlyDSLGemmConfig]:
+    tile_k_multiplier = 4 if mxfp_format == "mxfp4" else 2
+    return [replace(c, TILE_K=c.TILE_K * tile_k_multiplier) for c in gemm_configs]
+
+
+@functools.cache
+def _get_mxfp_candidates(
+    mxfp_format: MXFPFormat, exhaustive: bool
+) -> list[FlyDSLGemmConfig]:
+    from torch._inductor.kernel.vendored_templates.flydsl.kernels import (
+        GEMM_DTYPE_MXFP4, GEMM_DTYPE_MXFP8,
+    )
+
+    dtype_id = GEMM_DTYPE_MXFP4 if mxfp_format == "mxfp4" else GEMM_DTYPE_MXFP8
+    if exhaustive:
+        selections = {
+            "TILE_M": [16, 32, 64, 96, 128, 256],
+            "TILE_N": [16, 32, 64, 96, 128, 256],
+            "TILE_K": [128, 256, 512, 1024]
+            if mxfp_format == "mxfp4"
+            else [128, 256, 512],
+            "STAGES": list(range(2, 7)),
+            "M_WAVES": [1, 2, 4],
+            "N_WAVES": [1, 2, 4],
+            "GROUP_M": [0, 4],
+            "USE_HALF_TILE_INTERLEAVED": [False, True],
+        }
+        candidates = [
+            FlyDSLGemmConfig(**dict(zip(selections, values)))
+            for values in product(*selections.values())
+        ]
+    else:
+        candidates = [_BASELINE_CONFIG[mxfp_format]]
+        candidates.extend(
+            FlyDSLGemmConfig(*args) for args in _MXFP_DEFAULT_CONFIG_ARGS[mxfp_format]
+        )
+        candidates.extend(
+            _project_mxfp_gemm_configs(mxfp_format, get_default_gemm_configs())
+        )
+    valid_configs = []
+    for candidate in dict.fromkeys(candidates):
+        try:
+            _make_gemm_param(asdict(candidate), dtype_id=dtype_id)
+            valid_configs.append(candidate)
+        except ValueError as error:
+            log.debug(
+                "Skipping invalid %s config %s: %s", mxfp_format, candidate, error
+            )
+    return valid_configs
 
 
 def _get_exhaustive_gfx950_grouped_gemm_configs() -> list[FlyDSLGemmConfig]:
